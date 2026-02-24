@@ -3,7 +3,7 @@
 
 sources:
   candata:
-    type: postgresql
+    type: postgres
     # Connection string loaded from DATABASE_URL env var
     connection_string: ${DATABASE_URL}
     # Or specify individual fields:

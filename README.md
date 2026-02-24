@@ -1,6 +1,6 @@
 # candata
 
-Canadian Data Intelligence Platform — monorepo.
+Canadian Data Intelligence Platform — monorepo edition
 
 Candata aggregates Statistics Canada, Bank of Canada, CMHC, and federal procurement data into a unified API and dashboard suite. A single Supabase PostgreSQL instance backs all four packages, with shared schema models and utility code used across the Python ETL pipeline, FastAPI backend, Next.js frontend, and Evidence.dev public dashboard.
 

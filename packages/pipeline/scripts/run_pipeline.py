@@ -4,7 +4,8 @@ scripts/run_pipeline.py — CLI entry point for candata ETL pipelines.
 
 Usage:
     python scripts/run_pipeline.py economic-pulse
-    python scripts/run_pipeline.py housing --year 2023
+    python scripts/run_pipeline.py housing
+    python scripts/run_pipeline.py housing --cmas toronto,vancouver
     python scripts/run_pipeline.py procurement --datasets contracts tenders
     python scripts/run_pipeline.py trade --start-date 2020-01-01
     python scripts/run_pipeline.py all --dry-run
@@ -81,6 +82,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma-separated StatCan table aliases for economic-pulse (gdp,cpi,unemployment,retail)",
     )
     parser.add_argument(
+        "--cmas",
+        type=parse_tables,
+        default=None,
+        metavar="CMA[,CMA...]",
+        help="Comma-separated CMA names for housing pipeline (e.g. toronto,vancouver)",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Extract and transform but do not write to Supabase",
@@ -120,6 +128,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             results = await run(
                 year=args.year,
                 start_date=args.start_date,
+                cmas=args.cmas,
                 dry_run=args.dry_run,
             )
             total = sum(r.records_loaded for r in results.values())
@@ -169,6 +178,7 @@ async def run_all(args: argparse.Namespace) -> None:
         ("housing", housing.run, {
             "year": args.year,
             "start_date": args.start_date,
+            "cmas": args.cmas,
             "dry_run": args.dry_run,
         }),
         ("procurement", procurement.run, {

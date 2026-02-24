@@ -81,7 +81,7 @@ if [[ -f "packages/api/pyproject.toml" ]] || [[ -f "packages/api/app/main.py" ]]
     cd packages/api
     _log_level="${LOG_LEVEL:-info}"
     _log_level="${_log_level,,}"  # lowercase for uvicorn
-    uvicorn app.main:app \
+    uvicorn candata_api.app:create_app --factory \
       --host "${API_HOST:-0.0.0.0}" \
       --port "${API_PORT:-8000}" \
       --reload \
