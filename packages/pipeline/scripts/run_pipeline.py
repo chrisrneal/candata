@@ -75,6 +75,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Procurement datasets to run (default: both)",
     )
     parser.add_argument(
+        "--fiscal-year",
+        type=str,
+        default=None,
+        metavar="YYYY-YYYY",
+        help="Filter procurement contracts to a fiscal year (e.g. 2024-2025)",
+    )
+    parser.add_argument(
         "--tables",
         type=parse_tables,
         default=None,
@@ -138,6 +145,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             from candata_pipeline.pipelines.procurement import run
             results = await run(
                 datasets=args.datasets,
+                fiscal_year=args.fiscal_year,
                 dry_run=args.dry_run,
             )
             total = sum(r.records_loaded for r in results.values())
