@@ -4,8 +4,8 @@
  * Keep this file in sync with the Python version.
  */
 
-import type { Frequency, DataSource, Tier } from './types/api.js';
-import type { GeographyLevel } from './types/geography.js';
+import type { Frequency, DataSource, Tier } from './types/api';
+import type { GeographyLevel } from './types/geography';
 
 // ---------------------------------------------------------------------------
 // Provinces and territories

@@ -1,0 +1,4 @@
+datasources:
+  candata:
+    package: "@evidence-dev/postgres"
+components: {}

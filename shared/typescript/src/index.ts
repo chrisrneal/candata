@@ -7,11 +7,11 @@
  */
 
 // Types
-export type { ApiResponse, ApiError, PaginationMeta, Links } from './types/api.js';
-export type { Indicator, IndicatorValue } from './types/indicators.js';
-export type { VacancyRate, AverageRent, HousingStart } from './types/housing.js';
-export type { Contract, Tender } from './types/procurement.js';
-export type { TradeFlow } from './types/trade.js';
+export type { ApiResponse, ApiError, PaginationMeta, Links } from './types/api';
+export type { Indicator, IndicatorValue } from './types/indicators';
+export type { VacancyRate, AverageRent, HousingStart } from './types/housing';
+export type { Contract, Tender } from './types/procurement';
+export type { TradeFlow } from './types/trade';
 export type {
   Geography,
   Province,
@@ -19,12 +19,12 @@ export type {
   CensusDivision,
   FSA,
   GeographyLevel,
-} from './types/geography.js';
+} from './types/geography';
 export type {
   Entity,
   EntityType,
   EntityRelationship,
-} from './types/entities.js';
+} from './types/entities';
 
 // Constants
 export {
@@ -38,4 +38,4 @@ export {
   DATA_SOURCES,
   TIERS,
   GEOGRAPHY_LEVELS,
-} from './constants.js';
+} from './constants';

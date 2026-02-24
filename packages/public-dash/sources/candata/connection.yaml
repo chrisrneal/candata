@@ -1,0 +1,9 @@
+name: candata
+type: postgres
+options:
+  host: localhost
+  port: 54322
+  database: postgres
+  user: postgres
+  password: postgres
+  ssl: false
