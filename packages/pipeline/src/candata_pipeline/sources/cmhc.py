@@ -1,39 +1,39 @@
 """
 sources/cmhc.py — CMHC Housing Market Information Portal source adapter.
 
-CMHC publishes housing data through their HMIP portal. This adapter
-targets the underlying API used by the portal (similar approach to the
-mountainmath/cmhc R package).
+CMHC publishes housing data through Statistics Canada as downloadable CSV
+tables and (historically) through the HMIP internal API.
 
-HMIP API base: https://www03.cmhc-schl.gc.ca/hmip-pimh
+Primary:  StatCan CSV ZIP downloads (reliable, always available).
+Fallback: CMHC's internal HMIPService POST endpoint (reverse-engineered
+          by the mountainmath/cmhc R package; currently returning 404).
 
-Key endpoints:
-  /en/TableMapChart/TableMatchingCriteria  — table discovery
-  /en/TableMapChart/GetTableData           — data download as JSON/CSV
+StatCan tables:
+  34-10-0127 — Vacancy rates, CMA level (total only)
+  34-10-0133 — Average rents, CMA level (by bedroom type + structure type)
+  34-10-0148 — Housing starts, CMA level (by dwelling type, monthly)
 
 We pull three datasets:
-  1. Vacancy Rates by bedroom type by CMA
-  2. Average Rents by bedroom type by CMA
-  3. Housing Starts by dwelling type by CMA/province
-
-Fallback: if HMIP API is unavailable, CMHC also publishes quarterly
-data releases on their website as CSV files.
+  1. Vacancy Rates by CMA            -> vacancy_rates table
+  2. Average Rents by bedroom type   -> average_rents table
+  3. Housing Starts by dwelling type  -> housing_starts table
 
 Output schemas:
-  Vacancy rates:  geography (cma_name), ref_date, bedroom_type, vacancy_rate, universe
-  Average rents:  geography (cma_name), ref_date, bedroom_type, average_rent
-  Housing starts: geography (province/cma), ref_date, dwelling_type, units
+  Vacancy rates:  sgc_code, ref_date, bedroom_type, vacancy_rate, universe
+  Average rents:  sgc_code, ref_date, bedroom_type, average_rent
+  Housing starts: sgc_code, ref_date, dwelling_type, units
 
 Usage:
     source = CMHCSource()
-    vacancy_df  = await source.run(dataset="vacancy_rates", year=2023)
-    rents_df    = await source.run(dataset="average_rents", year=2023)
-    starts_df   = await source.run(dataset="housing_starts", year=2023)
+    df = await source.extract(dataset="vacancy_rates")
+    df = await source.extract(dataset="housing_starts", cmhc_geo_ids=[2270])
 """
 
 from __future__ import annotations
 
+import asyncio
 import io
+import zipfile
 from datetime import date
 from typing import Any, Literal
 
@@ -41,7 +41,6 @@ import httpx
 import polars as pl
 import structlog
 
-from candata_shared.geo import cma_name_to_code, province_name_to_code
 from candata_pipeline.sources.base import BaseSource
 from candata_pipeline.utils.retry import with_retry
 
@@ -49,30 +48,141 @@ log = structlog.get_logger(__name__)
 
 Dataset = Literal["vacancy_rates", "average_rents", "housing_starts"]
 
-# HMIP survey type codes
-_SURVEY_CODES: dict[Dataset, str] = {
-    "vacancy_rates": "2",   # Rental Market Survey
-    "average_rents": "2",   # Rental Market Survey
-    "housing_starts": "1",  # Starts and Completions Survey
+# ---------------------------------------------------------------------------
+# CMHC internal geography IDs -> StatCan SGC codes for top CMAs
+# ---------------------------------------------------------------------------
+CMHC_GEO_TO_SGC: dict[int, str] = {
+    2270: "535",   # Toronto
+    2480: "462",   # Montreal
+    2410: "933",   # Vancouver
+    140:  "825",   # Calgary
+    160:  "835",   # Edmonton
+    1680: "505",   # Ottawa-Gatineau
+    1900: "602",   # Winnipeg
+    2020: "421",   # Quebec City
+    520:  "537",   # Hamilton
+    580:  "205",   # Halifax
+    1020: "555",   # London
+    3340: "935",   # Victoria
+    1140: "568",   # Kitchener-Cambridge-Waterloo
+    780:  "559",   # Windsor
+    1780: "725",   # Saskatoon
+    1760: "705",   # Regina
+    260:  "305",   # Moncton
+    2600: "408",   # Sherbrooke
+    200:  "001",   # St. John's
+    640:  "595",   # Guelph
+    420:  "570",   # St. Catharines-Niagara
+    1000: "543",   # Oshawa
+    460:  "596",   # Barrie
+    2120: "442",   # Saguenay
+    2040: "433",   # Trois-Rivieres
+    480:  "590",   # Brantford
+    540:  "541",   # Peterborough
+    360:  "310",   # Saint John
+    1380: "996",   # Kelowna
+    960:  "620",   # Greater Sudbury
 }
 
+# Reverse lookup: SGC code -> CMHC geo ID
+SGC_TO_CMHC_GEO: dict[str, int] = {v: k for k, v in CMHC_GEO_TO_SGC.items()}
+
+# Human-friendly CMA names for each CMHC geo ID
+CMHC_GEO_NAMES: dict[int, str] = {
+    2270: "Toronto",
+    2480: "Montréal",
+    2410: "Vancouver",
+    140:  "Calgary",
+    160:  "Edmonton",
+    1680: "Ottawa-Gatineau",
+    1900: "Winnipeg",
+    2020: "Québec",
+    520:  "Hamilton",
+    580:  "Halifax",
+    1020: "London",
+    3340: "Victoria",
+    1140: "Kitchener-Cambridge-Waterloo",
+    780:  "Windsor",
+    1780: "Saskatoon",
+    1760: "Regina",
+    260:  "Moncton",
+    2600: "Sherbrooke",
+    200:  "St. John's",
+    640:  "Guelph",
+    420:  "St. Catharines-Niagara",
+    1000: "Oshawa",
+    460:  "Barrie",
+    2120: "Saguenay",
+    2040: "Trois-Rivières",
+    480:  "Brantford",
+    540:  "Peterborough",
+    360:  "Saint John",
+    1380: "Kelowna",
+    960:  "Greater Sudbury",
+}
+
+# CMA name (lowercased) -> CMHC geo ID for --cmas filtering
+CMA_NAME_TO_CMHC: dict[str, int] = {
+    name.lower(): geo_id for geo_id, name in CMHC_GEO_NAMES.items()
+}
+# Add common short aliases
+CMA_NAME_TO_CMHC.update({
+    "montreal": 2480,
+    "quebec": 2020,
+    "quebec city": 2020,
+    "ottawa": 1680,
+    "kitchener": 1140,
+    "st catharines": 420,
+    "st. catharines": 420,
+    "trois-rivieres": 2040,
+    "trois rivieres": 2040,
+    "sudbury": 960,
+    "st johns": 200,
+    "st. johns": 200,
+    "st. john's": 200,
+})
+
+# ---------------------------------------------------------------------------
+# StatCan table IDs for CMHC data (primary source)
+# ---------------------------------------------------------------------------
+_STATCAN_TABLES: dict[Dataset, str] = {
+    "vacancy_rates": "34100127",
+    "average_rents": "34100133",
+    "housing_starts": "34100148",
+}
+
+_STATCAN_CSV_URL = "https://www150.statcan.gc.ca/n1/tbl/csv/{table}-eng.zip"
+
+# ---------------------------------------------------------------------------
 # Standard bedroom type normalisation
+# ---------------------------------------------------------------------------
 _BEDROOM_NORMALIZE: dict[str, str] = {
     "bachelor": "bachelor",
     "bach.": "bachelor",
     "studio": "bachelor",
+    "bachelor units": "bachelor",
+    "0": "bachelor",
     "1 bedroom": "1br",
     "1-bedroom": "1br",
     "1br": "1br",
+    "1": "1br",
+    "one bedroom units": "1br",
     "2 bedrooms": "2br",
     "2-bedroom": "2br",
     "2br": "2br",
+    "2": "2br",
+    "two bedroom units": "2br",
     "3 bedrooms +": "3br+",
     "3 bedrooms+": "3br+",
     "3-bedroom+": "3br+",
     "3br+": "3br+",
+    "3+": "3br+",
+    "3": "3br+",
+    "three bedroom units and over": "3br+",
     "total": "total",
     "all": "total",
+    "all bedroom types": "total",
+    "total units": "total",
 }
 
 # Standard dwelling type normalisation
@@ -85,88 +195,291 @@ _DWELLING_NORMALIZE: dict[str, str] = {
     "semi": "semi",
     "row": "row",
     "row housing": "row",
+    "townhouse": "row",
     "apartment": "apartment",
+    "apartment and other": "apartment",
     "apt": "apartment",
     "all types": "total",
     "total": "total",
+    "all": "total",
+    "total units": "total",
 }
 
-# CMHC Open Data CSV URLs (fallback when HMIP API is blocked)
-_OPEN_DATA_URLS: dict[Dataset, str] = {
-    "vacancy_rates": (
-        "https://www.cmhc-schl.gc.ca/en/professionals/housing-markets-data-and-research/"
-        "housing-data/data-tables/rental-market/rental-market-report-data-tables"
-    ),
-    "average_rents": (
-        "https://www.cmhc-schl.gc.ca/en/professionals/housing-markets-data-and-research/"
-        "housing-data/data-tables/rental-market/rental-market-report-data-tables"
-    ),
-    "housing_starts": (
-        "https://www03.cmhc-schl.gc.ca/hmip-pimh/en/TableMapChart/GetTableData"
-    ),
-}
+# StatCan GEO name -> SGC code mapping (built from CMA names)
+# The StatCan CSV GEO column is "Toronto, Ontario" style.
+_GEO_NAME_TO_SGC: dict[str, str] = {}
+
+
+def _build_geo_name_lookup() -> dict[str, str]:
+    """Build a lookup from normalized CMA name to SGC code."""
+    if _GEO_NAME_TO_SGC:
+        return _GEO_NAME_TO_SGC
+
+    # Province names for matching "City, Province" format
+    _provinces = {
+        "newfoundland and labrador", "prince edward island", "nova scotia",
+        "new brunswick", "quebec", "ontario", "manitoba", "saskatchewan",
+        "alberta", "british columbia", "yukon", "northwest territories", "nunavut",
+    }
+
+    for geo_id, name in CMHC_GEO_NAMES.items():
+        sgc = CMHC_GEO_TO_SGC[geo_id]
+        # Normalize: lowercase, strip accents for matching
+        key = name.lower().replace("é", "e").replace("è", "e").replace("ê", "e")
+        _GEO_NAME_TO_SGC[key] = sgc
+        # Also add with common province suffixes expected in StatCan data
+        _GEO_NAME_TO_SGC[name.lower()] = sgc
+
+    return _GEO_NAME_TO_SGC
+
+
+def _extract_sgc_from_geo(geo_name: str) -> str | None:
+    """
+    Extract SGC code from a StatCan GEO column value like "Toronto, Ontario".
+
+    Falls back to substring matching against known CMA names.
+    """
+    lookup = _build_geo_name_lookup()
+
+    # Try the city part (before comma)
+    city = geo_name.split(",")[0].strip().lower()
+    city_normalized = city.replace("é", "e").replace("è", "e").replace("ê", "e")
+
+    if city_normalized in lookup:
+        return lookup[city_normalized]
+    if city in lookup:
+        return lookup[city]
+
+    # Try full string
+    full = geo_name.strip().lower()
+    full_normalized = full.replace("é", "e").replace("è", "e").replace("ê", "e")
+    if full_normalized in lookup:
+        return lookup[full_normalized]
+
+    # Fuzzy: check if any known name is a substring
+    for key, sgc in lookup.items():
+        if key in city_normalized or city_normalized in key:
+            return sgc
+
+    return None
+
+
+def normalize_bedroom(raw: Any) -> str | None:
+    """Normalize a bedroom type string to our enum."""
+    if raw is None:
+        return None
+    s = str(raw).strip().lower()
+    return _BEDROOM_NORMALIZE.get(s)
+
+
+def normalize_dwelling(raw: Any) -> str | None:
+    """Normalize a dwelling type string to our enum."""
+    if raw is None:
+        return None
+    s = str(raw).strip().lower()
+    return _DWELLING_NORMALIZE.get(s)
 
 
 class CMHCSource(BaseSource):
-    """Pulls CMHC rental market and housing starts data from HMIP."""
+    """
+    Pulls CMHC rental market and housing starts data.
+
+    Primary: StatCan CSV ZIP downloads.
+    Fallback: CMHC HMIP internal API (currently broken, kept for future).
+    """
 
     name = "CMHC"
 
-    _HMIP_BASE = "https://www03.cmhc-schl.gc.ca/hmip-pimh"
+    _HMIP_API_URL = "https://www03.cmhc-schl.gc.ca/hmip-pimh/api/HMIPService"
 
     def __init__(self, timeout: float = 60.0) -> None:
         super().__init__()
         self._timeout = timeout
 
     # ------------------------------------------------------------------
-    # HMIP API fetch
+    # Primary: StatCan CSV ZIP downloads
     # ------------------------------------------------------------------
 
     @with_retry(max_attempts=3, base_delay=2.0, retry_on=(httpx.HTTPError,))
-    async def _fetch_hmip(
-        self,
-        dataset: Dataset,
-        year: int,
-        geography_type_id: str = "3",  # 3 = CMA
-    ) -> dict[str, Any]:
-        """
-        POST to the HMIP TableMatchingCriteria endpoint.
-
-        Returns JSON payload with 'Headers' and 'Data' arrays.
-        """
-        survey_code = _SURVEY_CODES[dataset]
-
-        params = {
-            "GeographyType": geography_type_id,
-            "GeographyId": "35",          # Ontario as default; real impl iterates all
-            "DisplayAs": "Table",
-            "ForDate": f"{year}-10-01",   # October = fall survey
-            "Frequency": "2",             # Semi-annual
-            "SurveyTypeId": survey_code,
-        }
-        url = f"{self._HMIP_BASE}/en/TableMapChart/GetTableData"
-        self._log.info("hmip_fetch", url=url, dataset=dataset, year=year)
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            response = await client.get(url, params=params)
-            response.raise_for_status()
-            return response.json()
-
-    @with_retry(max_attempts=3, base_delay=2.0, retry_on=(httpx.HTTPError,))
-    async def _fetch_starts_csv(self, year: int) -> bytes:
-        """
-        Download housing starts CSV from CMHC for a given year.
-        Uses the HMIP table download endpoint.
-        """
-        url = (
-            f"{self._HMIP_BASE}/en/TableMapChart/DownloadTbl"
-            f"?TableId=2.1.31.3&GeographyId=1&GeographyTypeId=1"
-            f"&DisplayAs=Table&ForDate={year}-10-01&Frequency=1"
-        )
-        self._log.info("hmip_starts_download", url=url, year=year)
+    async def _download_statcan_zip(self, table_id: str) -> bytes:
+        """Download a StatCan CSV ZIP file and return raw bytes."""
+        url = _STATCAN_CSV_URL.format(table=table_id)
+        self._log.info("statcan_download", url=url, table_id=table_id)
         async with httpx.AsyncClient(timeout=self._timeout, follow_redirects=True) as client:
-            r = await client.get(url)
-            r.raise_for_status()
-            return r.content
+            response = await client.get(url)
+            response.raise_for_status()
+            return response.content
+
+    def _extract_csv_from_zip(self, zip_bytes: bytes, table_id: str) -> pl.DataFrame:
+        """
+        Extract the data CSV from a StatCan ZIP file.
+
+        StatCan ZIPs contain two files: {table_id}.csv and {table_id}_MetaData.csv.
+        We want the data CSV, not the metadata.
+        """
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            # Find the data CSV (not metadata)
+            data_file = None
+            for name in zf.namelist():
+                if name.endswith(".csv") and "MetaData" not in name:
+                    data_file = name
+                    break
+
+            if not data_file:
+                self._log.warning("zip_no_csv", table_id=table_id, files=zf.namelist())
+                return pl.DataFrame()
+
+            with zf.open(data_file) as f:
+                csv_text = f.read().decode("utf-8-sig")
+                return pl.read_csv(
+                    io.StringIO(csv_text),
+                    infer_schema_length=10000,
+                    truncate_ragged_lines=True,
+                )
+
+    def _filter_cma_rows(
+        self,
+        df: pl.DataFrame,
+        cmhc_geo_ids: list[int] | None,
+    ) -> pl.DataFrame:
+        """
+        Filter a StatCan DataFrame to only include rows for our mapped CMAs.
+
+        Adds an 'sgc_code' column based on the GEO name.
+        """
+        if "GEO" not in df.columns:
+            return pl.DataFrame()
+
+        # Map GEO names to SGC codes
+        df = df.with_columns(
+            pl.col("GEO").cast(pl.String).map_elements(
+                _extract_sgc_from_geo, return_dtype=pl.String
+            ).alias("sgc_code")
+        )
+
+        # Drop rows we can't map
+        df = df.filter(pl.col("sgc_code").is_not_null())
+
+        # Filter to specific CMAs if requested
+        if cmhc_geo_ids is not None:
+            target_sgc = {CMHC_GEO_TO_SGC[gid] for gid in cmhc_geo_ids if gid in CMHC_GEO_TO_SGC}
+            df = df.filter(pl.col("sgc_code").is_in(list(target_sgc)))
+
+        return df
+
+    def _parse_ref_date(self, raw: str) -> date | None:
+        """Parse StatCan REF_DATE strings like '2025' or '2025-06' to date."""
+        raw = raw.strip()
+        try:
+            if len(raw) == 4:  # Year only: "2025"
+                return date(int(raw), 10, 1)  # Default to October (vacancy survey month)
+            elif len(raw) == 7:  # Year-month: "2025-06"
+                parts = raw.split("-")
+                return date(int(parts[0]), int(parts[1]), 1)
+            else:
+                return None
+        except (ValueError, IndexError):
+            return None
+
+    def _transform_statcan_vacancy(self, df: pl.DataFrame) -> pl.DataFrame:
+        """Transform StatCan table 34-10-0127 (vacancy rates) into our schema."""
+        if df.is_empty():
+            return pl.DataFrame()
+
+        # Filter to valid rows with values
+        df = df.filter(pl.col("VALUE").is_not_null())
+
+        result = df.with_columns([
+            pl.col("REF_DATE").cast(pl.String).map_elements(self._parse_ref_date, return_dtype=pl.Date).alias("ref_date"),
+            pl.col("VALUE").cast(pl.Float64, strict=False).alias("vacancy_rate"),
+            pl.lit("total").alias("bedroom_type"),  # This table has totals only
+        ])
+
+        output_cols = [c for c in ["sgc_code", "ref_date", "bedroom_type", "vacancy_rate"]
+                       if c in result.columns]
+        return result.select(output_cols).filter(
+            pl.col("ref_date").is_not_null() & pl.col("vacancy_rate").is_not_null()
+        )
+
+    def _transform_statcan_rents(self, df: pl.DataFrame) -> pl.DataFrame:
+        """Transform StatCan table 34-10-0133 (average rents) into our schema."""
+        if df.is_empty():
+            return pl.DataFrame()
+
+        # Filter to valid rows with values
+        df = df.filter(pl.col("VALUE").is_not_null())
+
+        # Filter to apartment structures only (most relevant)
+        if "Type of structure" in df.columns:
+            df = df.filter(
+                pl.col("Type of structure").str.contains("(?i)apartment|row and apartment")
+            )
+
+        # Map bedroom types from "Type of unit" column
+        bedroom_col = "Type of unit" if "Type of unit" in df.columns else None
+
+        result = df.with_columns([
+            pl.col("REF_DATE").cast(pl.String).map_elements(self._parse_ref_date, return_dtype=pl.Date).alias("ref_date"),
+            pl.col("VALUE").cast(pl.Float64, strict=False).alias("average_rent"),
+        ])
+
+        if bedroom_col:
+            result = result.with_columns(
+                pl.col(bedroom_col).map_elements(
+                    normalize_bedroom, return_dtype=pl.String
+                ).alias("bedroom_type")
+            )
+            result = result.filter(pl.col("bedroom_type").is_not_null())
+
+        output_cols = [c for c in ["sgc_code", "ref_date", "bedroom_type", "average_rent"]
+                       if c in result.columns]
+        return result.select(output_cols).filter(
+            pl.col("ref_date").is_not_null() & pl.col("average_rent").is_not_null()
+        )
+
+    def _transform_statcan_starts(self, df: pl.DataFrame) -> pl.DataFrame:
+        """Transform StatCan table 34-10-0148 (housing starts) into our schema."""
+        if df.is_empty():
+            return pl.DataFrame()
+
+        # Filter to valid rows with values
+        df = df.filter(pl.col("VALUE").is_not_null())
+
+        # Filter to actual starts (not completions, absorptions, etc.)
+        if "Housing estimates" in df.columns:
+            df = df.filter(
+                pl.col("Housing estimates").str.contains("(?i)starts")
+            )
+
+        # Map dwelling types
+        dwelling_col = "Type of dwelling unit" if "Type of dwelling unit" in df.columns else None
+
+        result = df.with_columns([
+            pl.col("REF_DATE").cast(pl.String).map_elements(self._parse_ref_date, return_dtype=pl.Date).alias("ref_date"),
+            pl.col("VALUE").cast(pl.Float64, strict=False).alias("units_float"),
+        ]).with_columns(
+            pl.col("units_float").cast(pl.Int64, strict=False).alias("units")
+        )
+
+        if dwelling_col:
+            result = result.with_columns(
+                pl.col(dwelling_col).map_elements(
+                    normalize_dwelling, return_dtype=pl.String
+                ).alias("dwelling_type")
+            )
+            result = result.filter(pl.col("dwelling_type").is_not_null())
+
+        # Aggregate across market types (Homeowner, Rental, Condo, etc.)
+        # to get total starts per dwelling type per CMA per date
+        group_cols = [c for c in ["sgc_code", "ref_date", "dwelling_type"] if c in result.columns]
+        if group_cols and "units" in result.columns:
+            result = result.group_by(group_cols).agg(pl.col("units").sum())
+
+        output_cols = [c for c in ["sgc_code", "ref_date", "dwelling_type", "units"]
+                       if c in result.columns]
+        return result.select(output_cols).filter(
+            pl.col("ref_date").is_not_null() & pl.col("units").is_not_null()
+        )
 
     # ------------------------------------------------------------------
     # BaseSource interface
@@ -178,198 +491,84 @@ class CMHCSource(BaseSource):
         dataset: Dataset = "vacancy_rates",
         year: int | None = None,
         start_date: date | None = None,
+        cmhc_geo_ids: list[int] | None = None,
         **kwargs: Any,
     ) -> pl.DataFrame:
         """
-        Download CMHC data for the given dataset and year.
+        Download CMHC data for the given dataset across all (or selected) CMAs.
+
+        Primary approach: download StatCan CSV ZIP for the whole table,
+        then filter to relevant CMAs.
 
         Args:
-            dataset:    One of "vacancy_rates", "average_rents", "housing_starts".
-            year:       Reference year (defaults to current year - 1).
-            start_date: If set, fetch data from this year onwards (overrides year).
+            dataset:      One of "vacancy_rates", "average_rents", "housing_starts".
+            year:         Reference year (unused, kept for compat).
+            start_date:   If set, filter to data from this date onwards.
+            cmhc_geo_ids: List of CMHC geo IDs to keep. Defaults to all mapped CMAs.
 
         Returns:
-            Raw polars DataFrame (schema varies by dataset).
+            Combined polars DataFrame for all requested CMAs.
         """
-        import datetime
-        if year is None:
-            year = datetime.date.today().year - 1
-        if start_date:
-            year = start_date.year
+        self._log.info(
+            "cmhc_extract_start",
+            dataset=dataset,
+            n_cmas=len(cmhc_geo_ids) if cmhc_geo_ids else len(CMHC_GEO_TO_SGC),
+        )
 
-        if dataset == "housing_starts":
-            csv_bytes = await self._fetch_starts_csv(year)
-            return pl.read_csv(
-                io.BytesIO(csv_bytes),
-                infer_schema_length=0,
-                truncate_ragged_lines=True,
+        table_id = _STATCAN_TABLES[dataset]
+
+        try:
+            zip_bytes = await self._download_statcan_zip(table_id)
+            raw_df = self._extract_csv_from_zip(zip_bytes, table_id)
+
+            if raw_df.is_empty():
+                self._log.warning("statcan_csv_empty", table_id=table_id)
+                return pl.DataFrame()
+
+            # Filter to our CMAs and add sgc_code
+            df = self._filter_cma_rows(raw_df, cmhc_geo_ids)
+
+            if df.is_empty():
+                self._log.warning("statcan_no_matching_cmas", table_id=table_id)
+                return pl.DataFrame()
+
+            # Apply dataset-specific transformation
+            if dataset == "vacancy_rates":
+                result = self._transform_statcan_vacancy(df)
+            elif dataset == "average_rents":
+                result = self._transform_statcan_rents(df)
+            else:
+                result = self._transform_statcan_starts(df)
+
+            # Filter by start_date if specified
+            if start_date and "ref_date" in result.columns:
+                result = result.filter(pl.col("ref_date") >= start_date)
+
+            self._log.info(
+                "cmhc_extract_complete",
+                dataset=dataset,
+                total_rows=len(result),
             )
+            return result
 
-        # Vacancy / rents via HMIP JSON
-        payload = await self._fetch_hmip(dataset, year)
-        headers: list[str] = payload.get("Headers", [])
-        data_rows: list[list[Any]] = payload.get("Data", [])
-        if not data_rows:
-            return pl.DataFrame({h: [] for h in (headers or ["geography", "value"])})
-        return pl.DataFrame(data_rows, schema=headers if headers else None, orient="row")
+        except Exception as exc:
+            self._log.error("statcan_download_failed", table_id=table_id, error=str(exc))
+            return pl.DataFrame()
 
     def transform(self, raw: pl.DataFrame, *, dataset: Dataset = "vacancy_rates") -> pl.DataFrame:
         """
         Normalize CMHC raw data to domain schema.
 
-        Output columns vary by dataset — see module docstring.
+        Data is already transformed during extraction via StatCan CSVs.
+        This method is kept for the BaseSource interface.
         """
-        if raw.is_empty():
-            return raw
-
-        df = self._normalize_columns(raw)
-
-        if dataset == "vacancy_rates":
-            return self._transform_vacancy(df)
-        elif dataset == "average_rents":
-            return self._transform_rents(df)
-        else:
-            return self._transform_starts(df)
-
-    # ------------------------------------------------------------------
-    # Dataset-specific transforms
-    # ------------------------------------------------------------------
-
-    def _normalize_bedroom(self, raw: str | None) -> str | None:
-        if not raw:
-            return None
-        return _BEDROOM_NORMALIZE.get(raw.strip().lower())
-
-    def _normalize_dwelling(self, raw: str | None) -> str | None:
-        if not raw:
-            return None
-        return _DWELLING_NORMALIZE.get(raw.strip().lower())
-
-    def _transform_vacancy(self, df: pl.DataFrame) -> pl.DataFrame:
-        """Normalize HMIP rental market survey → vacancy_rates schema."""
-        # Expected columns (HMIP may vary): geography, date, bedroom_type,
-        #   vacancy_rate, universe
-        # Try to find sensible columns by pattern
-        col_map: dict[str, str] = {}
-        for col in df.columns:
-            lower = col.lower()
-            if "geograph" in lower or lower == "geography":
-                col_map["geography"] = col
-            elif "date" in lower or "period" in lower:
-                col_map["date"] = col
-            elif "bedroom" in lower or "type" in lower:
-                col_map["bedroom_type"] = col
-            elif "vacancy" in lower or "rate" in lower:
-                col_map["vacancy_rate"] = col
-            elif "universe" in lower or "total" in lower:
-                col_map["universe"] = col
-
-        result_cols: dict[str, pl.Expr] = {}
-
-        # Geography → CMA code
-        if "geography" in col_map:
-            result_cols["cma_name"] = pl.col(col_map["geography"])
-            result_cols["sgc_code"] = pl.col(col_map["geography"]).map_elements(
-                lambda g: cma_name_to_code(g) or province_name_to_code(g),
-                return_dtype=pl.String,
-            )
-
-        # Reference date
-        if "date" in col_map:
-            result_cols["ref_date"] = pl.col(col_map["date"]).str.to_date(strict=False)
-
-        # Bedroom type
-        if "bedroom_type" in col_map:
-            result_cols["bedroom_type"] = pl.col(col_map["bedroom_type"]).map_elements(
-                self._normalize_bedroom, return_dtype=pl.String
-            )
-
-        # Vacancy rate
-        if "vacancy_rate" in col_map:
-            result_cols["vacancy_rate"] = pl.col(col_map["vacancy_rate"]).cast(
-                pl.Float64, strict=False
-            )
-
-        # Universe
-        if "universe" in col_map:
-            result_cols["universe"] = pl.col(col_map["universe"]).cast(
-                pl.Int64, strict=False
-            )
-
-        return df.with_columns(**result_cols).select(list(result_cols.keys()))
-
-    def _transform_rents(self, df: pl.DataFrame) -> pl.DataFrame:
-        """Normalize HMIP rental market survey → average_rents schema."""
-        col_map: dict[str, str] = {}
-        for col in df.columns:
-            lower = col.lower()
-            if "geograph" in lower:
-                col_map["geography"] = col
-            elif "date" in lower or "period" in lower:
-                col_map["date"] = col
-            elif "bedroom" in lower or "type" in lower:
-                col_map["bedroom_type"] = col
-            elif "rent" in lower or "average" in lower:
-                col_map["average_rent"] = col
-
-        result_cols: dict[str, pl.Expr] = {}
-        if "geography" in col_map:
-            result_cols["cma_name"] = pl.col(col_map["geography"])
-            result_cols["sgc_code"] = pl.col(col_map["geography"]).map_elements(
-                lambda g: cma_name_to_code(g) or province_name_to_code(g),
-                return_dtype=pl.String,
-            )
-        if "date" in col_map:
-            result_cols["ref_date"] = pl.col(col_map["date"]).str.to_date(strict=False)
-        if "bedroom_type" in col_map:
-            result_cols["bedroom_type"] = pl.col(col_map["bedroom_type"]).map_elements(
-                self._normalize_bedroom, return_dtype=pl.String
-            )
-        if "average_rent" in col_map:
-            result_cols["average_rent"] = pl.col(col_map["average_rent"]).cast(
-                pl.Float64, strict=False
-            )
-        return df.with_columns(**result_cols).select(list(result_cols.keys()))
-
-    def _transform_starts(self, df: pl.DataFrame) -> pl.DataFrame:
-        """Normalize housing starts CSV → housing_starts schema."""
-        col_map: dict[str, str] = {}
-        for col in df.columns:
-            lower = col.lower()
-            if "geograph" in lower or "area" in lower or "cma" in lower:
-                col_map["geography"] = col
-            elif "date" in lower or "ref" in lower or "period" in lower:
-                col_map["date"] = col
-            elif "type" in lower or "dwelling" in lower:
-                col_map["dwelling_type"] = col
-            elif "unit" in lower or "start" in lower or "total" in lower:
-                col_map["units"] = col
-
-        result_cols: dict[str, pl.Expr] = {}
-        if "geography" in col_map:
-            result_cols["cma_name"] = pl.col(col_map["geography"])
-            result_cols["sgc_code"] = pl.col(col_map["geography"]).map_elements(
-                lambda g: cma_name_to_code(g) or province_name_to_code(g),
-                return_dtype=pl.String,
-            )
-        if "date" in col_map:
-            from candata_shared.time_utils import parse_statcan_date
-            result_cols["ref_date"] = pl.col(col_map["date"]).map_elements(
-                parse_statcan_date, return_dtype=pl.Date
-            )
-        if "dwelling_type" in col_map:
-            result_cols["dwelling_type"] = pl.col(col_map["dwelling_type"]).map_elements(
-                self._normalize_dwelling, return_dtype=pl.String
-            )
-        if "units" in col_map:
-            result_cols["units"] = pl.col(col_map["units"]).cast(pl.Int64, strict=False)
-
-        return df.with_columns(**result_cols).select(list(result_cols.keys()))
+        return raw
 
     async def get_metadata(self) -> dict[str, Any]:
         return {
             "source_name": self.name,
-            "base_url": self._HMIP_BASE,
-            "description": "CMHC Housing Market Information Portal",
-            "datasets": list(_SURVEY_CODES.keys()),
+            "statcan_tables": _STATCAN_TABLES,
+            "description": "CMHC Housing Market data via Statistics Canada",
+            "datasets": ["vacancy_rates", "average_rents", "housing_starts"],
+            "n_cmas": len(CMHC_GEO_TO_SGC),
         }

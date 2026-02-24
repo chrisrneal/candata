@@ -1,0 +1,15 @@
+{
+  "Headers": ["Geography", "Date", "Dwelling Type", "Units"],
+  "Data": [
+    ["Calgary", "2023-10-01", "Single-Detached", "1250"],
+    ["Calgary", "2023-10-01", "Semi-Detached", "320"],
+    ["Calgary", "2023-10-01", "Row", "780"],
+    ["Calgary", "2023-10-01", "Apartment", "4500"],
+    ["Calgary", "2023-10-01", "Total", "6850"],
+    ["Calgary", "2023-04-01", "Single-Detached", "1100"],
+    ["Calgary", "2023-04-01", "Semi-Detached", "290"],
+    ["Calgary", "2023-04-01", "Row", "720"],
+    ["Calgary", "2023-04-01", "Apartment", "4200"],
+    ["Calgary", "2023-04-01", "Total", "6310"]
+  ]
+}

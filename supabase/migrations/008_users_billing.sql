@@ -104,13 +104,14 @@ $$;
 -- usage_logs — per-request log for analytics and billing
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS usage_logs (
-  id               UUID        PRIMARY KEY DEFAULT uuid_generate_v4(),
+  id               UUID        DEFAULT uuid_generate_v4(),
   api_key_id       UUID        REFERENCES api_keys(id) ON DELETE SET NULL,
   endpoint         TEXT        NOT NULL,
   method           TEXT        NOT NULL DEFAULT 'GET',
   status_code      INTEGER,
   response_time_ms INTEGER,
-  created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (id, created_at)
 ) PARTITION BY RANGE (created_at);
 
 -- Create initial monthly partitions

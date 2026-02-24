@@ -1,0 +1,15 @@
+{
+  "Headers": ["Geography", "Date", "Bedroom Type", "Average Rent ($)"],
+  "Data": [
+    ["Vancouver", "2023-10-01", "Bachelor", "1450"],
+    ["Vancouver", "2023-10-01", "1 Bedroom", "1750"],
+    ["Vancouver", "2023-10-01", "2 Bedrooms", "2200"],
+    ["Vancouver", "2023-10-01", "3 Bedrooms +", "2800"],
+    ["Vancouver", "2023-10-01", "Total", "1950"],
+    ["Vancouver", "2022-10-01", "Bachelor", "1350"],
+    ["Vancouver", "2022-10-01", "1 Bedroom", "1650"],
+    ["Vancouver", "2022-10-01", "2 Bedrooms", "2050"],
+    ["Vancouver", "2022-10-01", "3 Bedrooms +", "2600"],
+    ["Vancouver", "2022-10-01", "Total", "1800"]
+  ]
+}

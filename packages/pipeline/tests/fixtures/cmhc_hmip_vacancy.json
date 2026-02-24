@@ -1,0 +1,15 @@
+{
+  "Headers": ["Geography", "Date", "Bedroom Type", "Vacancy Rate (%)", "Universe"],
+  "Data": [
+    ["Toronto", "2023-10-01", "Bachelor", "1.5", "45230"],
+    ["Toronto", "2023-10-01", "1 Bedroom", "1.8", "189450"],
+    ["Toronto", "2023-10-01", "2 Bedrooms", "1.3", "134820"],
+    ["Toronto", "2023-10-01", "3 Bedrooms +", "0.9", "23410"],
+    ["Toronto", "2023-10-01", "Total", "1.6", "392910"],
+    ["Toronto", "2022-10-01", "Bachelor", "2.0", "44100"],
+    ["Toronto", "2022-10-01", "1 Bedroom", "2.1", "187200"],
+    ["Toronto", "2022-10-01", "2 Bedrooms", "1.7", "133500"],
+    ["Toronto", "2022-10-01", "3 Bedrooms +", "1.2", "23100"],
+    ["Toronto", "2022-10-01", "Total", "1.9", "387900"]
+  ]
+}

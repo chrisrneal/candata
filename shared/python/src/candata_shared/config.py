@@ -11,15 +11,26 @@ Usage:
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Literal
 
-from pydantic import AnyHttpUrl, Field, field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _find_dotenv() -> Path | None:
+    """Walk up from CWD to find the nearest .env file."""
+    current = Path.cwd()
+    for parent in [current, *current.parents]:
+        candidate = parent / ".env"
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=_find_dotenv() or ".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
