@@ -326,6 +326,28 @@ class TestExtractTenders:
 
         assert df.is_empty()
 
+    @pytest.mark.asyncio
+    async def test_extract_tenders_403_fails_fast(self):
+        """A 403 (client error) should not be retried — fail immediately."""
+        source = ProcurementSource()
+
+        call_count = 0
+
+        def _count_and_respond(request):
+            nonlocal call_count
+            call_count += 1
+            return httpx.Response(403, text="Forbidden")
+
+        with respx.mock() as router:
+            router.get(url__startswith=_CANADABUYS_TENDERS_URL).mock(
+                side_effect=_count_and_respond
+            )
+
+            df = await source.extract(dataset="tenders")
+
+        assert df.is_empty()
+        assert call_count == 1, f"Expected 1 attempt (no retries), got {call_count}"
+
 
 # ---------------------------------------------------------------------------
 # Transform — contracts

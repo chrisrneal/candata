@@ -200,8 +200,19 @@ class ProcurementSource(BaseSource):
             "format": "json",
         }
         self._log.debug("tenders_fetch", page=page)
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
+        async with httpx.AsyncClient(
+            timeout=self._timeout, follow_redirects=True
+        ) as client:
             r = await client.get(_CANADABUYS_TENDERS_URL, params=params)
+            # Fail fast on 4xx — these are permanent client errors
+            # (e.g. 403 from the retired CanadaBuys API) and not
+            # worth retrying.  Wrap in RuntimeError so it bypasses
+            # the retry_on=(httpx.HTTPError,) filter.
+            if r.is_client_error:
+                raise RuntimeError(
+                    f"Client error '{r.status_code} {r.reason_phrase}' "
+                    f"for url '{r.url}'"
+                )
             r.raise_for_status()
             return r.json()
 
@@ -268,7 +279,14 @@ class ProcurementSource(BaseSource):
         return pl.concat(dfs, how="diagonal_relaxed")
 
     async def _extract_tenders(self, max_tenders: int) -> pl.DataFrame:
-        """Paginate the CanadaBuys tender API."""
+        """Paginate the CanadaBuys tender API.
+
+        NOTE: The CanadaBuys REST API was retired when buyandsell.gc.ca
+        migrated to a Drupal 10 site at canadabuys.canada.ca.  The endpoint
+        now returns 403/404. This method is kept for forward-compatibility in
+        case a replacement API is published.  Until then it will log a
+        warning and return an empty DataFrame.
+        """
         all_notices: list[dict[str, Any]] = []
         page = 1
         while len(all_notices) < max_tenders:
@@ -276,7 +294,12 @@ class ProcurementSource(BaseSource):
                 payload = await self._fetch_tenders_page(page)
             except Exception as exc:
                 self._log.warning(
-                    "tenders_page_failed", page=page, error=str(exc)
+                    "tenders_api_unavailable",
+                    page=page,
+                    error=str(exc),
+                    hint="The CanadaBuys REST API has been retired. "
+                    "Tenders extraction is skipped until a replacement "
+                    "API is available.",
                 )
                 break
             notices = payload.get("data", payload.get("notices", []))

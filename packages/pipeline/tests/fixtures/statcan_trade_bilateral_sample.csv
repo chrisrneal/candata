@@ -1,0 +1,8 @@
+"REF_DATE","GEO","DGUID","Trade","Principal trading partners","North American Product Classification System (NAPCS)","UOM","UOM_ID","SCALAR_FACTOR","SCALAR_ID","VECTOR","FRAME","COORDINATE","VALUE","STATUS","SYMBOL","TERMINATED","DECIMALS"
+"2024-01","Canada","2016A000011124","Import","United States","[0201] - Meat of bovine animals, fresh or chilled","Dollars","81","Units","0","v200001","","1.1","3000000","","","","0"
+"2024-01","Canada","2016A000011124","Export","United States","[0201] - Meat of bovine animals, fresh or chilled","Dollars","81","Units","0","v200002","","1.2","6000000","","","","0"
+"2024-01","Canada","2016A000011124","Import","China","[2709] - Petroleum oils and oils obtained from bituminous minerals, crude","Dollars","81","Units","0","v200003","","1.3","1000000","","","","0"
+"2024-01","Ontario","2016A000235","Export","United Kingdom","[0201] - Meat of bovine animals, fresh or chilled","Dollars","81","Units","0","v200004","","1.4","500000","","","","0"
+"2024-01","Canada","2016A000011124","Trade balance","United States","[0201] - Meat of bovine animals, fresh or chilled","Dollars","81","Units","0","v200005","","1.5","3000000","","","","0"
+"2024-02","Canada","2016A000011124","Import","Japan","[8703] - Motor cars and other motor vehicles","Dollars","81","Units","0","v200006","","1.6","9000000","","","","0"
+"2024-02","Alberta","2016A000248","Export","United States","[2709] - Petroleum oils and oils obtained from bituminous minerals, crude","Dollars","81","Units","0","v200007","","1.7","15000000","","","","0"
