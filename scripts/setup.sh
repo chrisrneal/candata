@@ -131,7 +131,7 @@ install_npm() {
   local dir="$1"
   if [[ -f "$dir/package.json" ]]; then
     info "  npm install in $dir..."
-    npm install --prefix "$dir" --silent
+    npm install --prefix "$dir" --silent --legacy-peer-deps
     success "  ✓ $dir"
   else
     warn "  ⚠ $dir/package.json not found — skipping"
