@@ -1,4 +1,3 @@
 datasources:
-  candata:
-    package: "@evidence-dev/postgres"
+  "@evidence-dev/postgres": {}
 components: {}
