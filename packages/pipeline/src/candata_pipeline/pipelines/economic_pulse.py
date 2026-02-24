@@ -8,11 +8,11 @@ Orchestrates:
   4. Upsert → indicator_values table
   5. Record pipeline_run metadata
 
-StatCan tables pulled:
-  3610043401 — GDP by industry (monthly)     → gdp_monthly
-  1810000401 — CPI all-items (monthly)       → cpi_monthly
-  1410028701 — Labour Force Survey (monthly) → unemployment_rate, employment_monthly
-  2010000801 — Retail Trade (monthly)        → retail_sales_monthly
+StatCan tables pulled (8-digit file IDs):
+  36100434 — GDP by industry (monthly)     → gdp_monthly
+  18100004 — CPI all-items (monthly)       → cpi_monthly
+  14100287 — Labour Force Survey (monthly) → unemployment_rate, employment_monthly
+  20100008 — Retail Trade (monthly)        → retail_sales_monthly
 
 BoC series pulled:
   FXUSDCAD   → usdcad
@@ -47,28 +47,36 @@ from candata_pipeline.utils.logging import configure_logging, get_logger
 
 log = get_logger(__name__, pipeline="economic_pulse")
 
-# StatCan table → (indicator_id, which VALUE filter if needed)
+# StatCan table file IDs (8-digit) → (indicator_id, frequency)
 STATCAN_TABLES: dict[str, dict[str, Any]] = {
-    "1810000401": {
+    "18100004": {
         "indicator_id": "cpi_monthly",
         "value_filter": None,
         "frequency": "monthly",
     },
-    "3610043401": {
+    "36100434": {
         "indicator_id": "gdp_monthly",
         "value_filter": None,
         "frequency": "monthly",
     },
-    "1410028701": {
+    "14100287": {
         "indicator_id": "unemployment_rate",
         "value_filter": None,
         "frequency": "monthly",
     },
-    "2010000801": {
+    "20100008": {
         "indicator_id": "retail_sales_monthly",
         "value_filter": None,
         "frequency": "monthly",
     },
+}
+
+# Short alias → table ID (for --tables CLI filter)
+TABLE_ALIASES: dict[str, str] = {
+    "cpi": "18100004",
+    "gdp": "36100434",
+    "unemployment": "14100287",
+    "retail": "20100008",
 }
 
 BOC_SERIES: list[str] = ["FXUSDCAD", "V39079", "V122530", "V80691338"]
@@ -161,6 +169,7 @@ async def run(
     start_date: date | None = None,
     end_date: date | None = None,
     dry_run: bool = False,
+    tables: list[str] | None = None,
 ) -> LoadResult:
     """
     Run the economic pulse pipeline end-to-end.
@@ -169,12 +178,28 @@ async def run(
         start_date: Earliest ref_date to fetch (None = all available).
         end_date:   Latest ref_date to fetch (None = today).
         dry_run:    If True, transform but do not write to Supabase.
+        tables:     Optional list of table aliases (e.g. ["gdp", "cpi"]) or
+                    8-digit table IDs to restrict which StatCan tables are run.
+                    If None, all tables are run.
 
     Returns:
         LoadResult with records_loaded, records_failed, and status.
     """
     configure_logging()
-    log.info("economic_pulse_start", start_date=str(start_date), dry_run=dry_run)
+    log.info("economic_pulse_start", start_date=str(start_date), dry_run=dry_run, tables=tables)
+
+    # Resolve table filter: accept short aliases or 8-digit IDs
+    active_tables = STATCAN_TABLES
+    if tables:
+        resolved_ids: set[str] = set()
+        for t in tables:
+            if t in TABLE_ALIASES:
+                resolved_ids.add(TABLE_ALIASES[t])
+            elif t in STATCAN_TABLES:
+                resolved_ids.add(t)
+            else:
+                log.warning("unknown_table_filter", table=t)
+        active_tables = {k: v for k, v in STATCAN_TABLES.items() if k in resolved_ids}
 
     loader = SupabaseLoader()
     geo_lookup = await loader.build_geo_lookup()
@@ -193,7 +218,7 @@ async def run(
         # Fetch all StatCan tables + BoC in parallel
         tasks = [
             _fetch_statcan(pid, cfg, normalizer, start_date)
-            for pid, cfg in STATCAN_TABLES.items()
+            for pid, cfg in active_tables.items()
         ]
         tasks.append(_fetch_boc(geo_lookup, start_date, end_date))
 

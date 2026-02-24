@@ -53,7 +53,7 @@ class TestStatCanExtract:
     async def test_extract_returns_dataframe(self, cpi_zip: bytes):
         source = StatCanSource()
         with respx.mock() as router:
-            router.get(url__regex=r".*downloadTbl.*").mock(
+            router.get(url__regex=r".*tbl/csv.*").mock(
                 return_value=httpx.Response(200, content=cpi_zip)
             )
             # Bypass DuckDB caching for tests
@@ -81,7 +81,7 @@ class TestStatCanExtract:
     async def test_extract_raises_on_http_error(self):
         source = StatCanSource()
         with respx.mock() as router:
-            router.get(url__regex=r".*downloadTbl.*").mock(
+            router.get(url__regex=r".*tbl/csv.*").mock(
                 return_value=httpx.Response(404)
             )
             with patch.object(source, "_is_cached", return_value=False):
@@ -92,7 +92,7 @@ class TestStatCanExtract:
     async def test_extract_gdp_table(self, gdp_zip: bytes):
         source = StatCanSource()
         with respx.mock() as router:
-            router.get(url__regex=r".*downloadTbl.*").mock(
+            router.get(url__regex=r".*tbl/csv.*").mock(
                 return_value=httpx.Response(200, content=gdp_zip)
             )
             with patch.object(source, "_is_cached", return_value=False):
@@ -215,3 +215,30 @@ class TestParseCsvZip:
             zf.writestr("1234_MetaData_en.csv", "metadata only")
         with pytest.raises(ValueError, match="No data CSV"):
             source._parse_csv_zip(buf.getvalue(), "1234")
+
+
+# ---------------------------------------------------------------------------
+# URL generation tests
+# ---------------------------------------------------------------------------
+
+class TestCsvZipUrl:
+    def test_url_uses_8digit_table_id(self):
+        source = StatCanSource()
+        url = source._csv_zip_url("1810000401")
+        assert "18100004-eng.zip" in url
+        assert "downloadTbl" not in url
+
+    def test_url_accepts_8digit_pid(self):
+        source = StatCanSource()
+        url = source._csv_zip_url("36100434")
+        assert "36100434-eng.zip" in url
+
+    def test_url_accepts_dashed_pid(self):
+        source = StatCanSource()
+        url = source._csv_zip_url("36-10-0434-01")
+        assert "36100434-eng.zip" in url
+
+    def test_url_uses_n1_tbl_csv_path(self):
+        source = StatCanSource()
+        url = source._csv_zip_url("18100004")
+        assert "/n1/tbl/csv/" in url

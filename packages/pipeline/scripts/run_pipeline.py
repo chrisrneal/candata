@@ -33,6 +33,9 @@ def parse_date(s: str) -> date:
         raise argparse.ArgumentTypeError(f"Invalid date: {s!r} — expected YYYY-MM-DD")
 
 
+def parse_tables(s: str) -> list[str]:
+    return [t.strip() for t in s.split(",") if t.strip()]
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="run_pipeline",
@@ -71,6 +74,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Procurement datasets to run (default: both)",
     )
     parser.add_argument(
+        "--tables",
+        type=parse_tables,
+        default=None,
+        metavar="TABLE[,TABLE...]",
+        help="Comma-separated StatCan table aliases for economic-pulse (gdp,cpi,unemployment,retail)",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Extract and transform but do not write to Supabase",
@@ -101,6 +111,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
                 start_date=args.start_date,
                 end_date=args.end_date,
                 dry_run=args.dry_run,
+                tables=args.tables,
             )
             log.info("done", records_loaded=result.records_loaded, status=result.status)
 
