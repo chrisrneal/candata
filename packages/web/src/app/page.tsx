@@ -1,15 +1,19 @@
-import { PROVINCES, INDICATOR_IDS } from '@candata/shared';
+import { Navbar } from '@/components/layout/navbar';
+import { Footer } from '@/components/layout/footer';
+import { Hero } from '@/components/marketing/hero';
+import { FeatureGrid } from '@/components/marketing/feature-grid';
+import { CtaSection } from '@/components/marketing/cta-section';
 
 export default function Home() {
   return (
-    <main>
-      <h1>candata</h1>
-      <p>Canadian Data Intelligence Platform</p>
-      <section>
-        <h2>Coverage</h2>
-        <p>{Object.keys(PROVINCES).length} provinces and territories</p>
-        <p>{INDICATOR_IDS.length} economic indicators</p>
-      </section>
-    </main>
+    <div className="min-h-screen flex flex-col">
+      <Navbar />
+      <main className="flex-1">
+        <Hero />
+        <FeatureGrid />
+        <CtaSection />
+      </main>
+      <Footer />
+    </div>
   );
 }
