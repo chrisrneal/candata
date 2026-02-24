@@ -2,6 +2,7 @@
   "name": "candata-public-dash",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
   "scripts": {
     "dev": "evidence dev",
     "build": "evidence build",
@@ -10,12 +11,20 @@
   },
   "dependencies": {
     "@candata/shared": "*",
-    "@evidence-dev/evidence": "^35.0.0",
-    "@evidence-dev/core-components": "^5.0.0",
+    "@evidence-dev/core-components": "4.2.0",
+    "@evidence-dev/evidence": "35.0.0",
+    "@evidence-dev/postgres": "^1.0.10",
     "@supabase/supabase-js": "^2.44.0"
   },
   "devDependencies": {
-    "@sveltejs/kit": "^2.5.0",
-    "svelte": "^4.2.0"
-  }
+    "@sveltejs/kit": "2.5.4",
+    "@sveltejs/vite-plugin-svelte": "^3.1.0",
+    "autoprefixer": "^10.4.24",
+    "postcss": "^8.5.6",
+    "svelte": "4.2.12",
+    "vite": "5.2.10"
+  },
+  "workspaces": [
+    "../../shared/typescript"
+  ]
 }

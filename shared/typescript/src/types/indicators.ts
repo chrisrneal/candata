@@ -2,7 +2,7 @@
  * types/indicators.ts — Indicator and IndicatorValue interfaces.
  */
 
-import type { Frequency, DataSource } from './api.js';
+import type { Frequency, DataSource } from './api';
 
 export interface Indicator {
   id: string;

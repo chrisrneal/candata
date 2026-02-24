@@ -49,13 +49,13 @@ log = structlog.get_logger(__name__)
 # Suppressed value markers used by StatCan
 _SUPPRESSED: frozenset[str] = frozenset({"x", "..", "...", "F", "E", "r", "p", ""})
 
-# Known table PIDs with their indicator mappings
+# Known table file IDs (8-digit) with their indicator mappings
 TABLE_INDICATOR_MAP: dict[str, str] = {
-    "3610043401": "gdp_monthly",
-    "1810000401": "cpi_monthly",
-    "1410028701": "unemployment_rate",   # also employment_monthly (different coord)
-    "2010000801": "retail_sales_monthly",
-    "1210001101": "trade_flows",         # handled separately by trade pipeline
+    "36100434": "gdp_monthly",
+    "18100004": "cpi_monthly",
+    "14100287": "unemployment_rate",   # also employment_monthly (different coord)
+    "20100008": "retail_sales_monthly",
+    "12100011": "trade_flows",         # handled separately by trade pipeline
 }
 
 
@@ -73,21 +73,42 @@ class StatCanSource(BaseSource):
     # URL helpers
     # ------------------------------------------------------------------
 
-    def _csv_zip_url(self, table_pid: str) -> str:
-        """Return the download URL for a full-table CSV zip."""
+    @staticmethod
+    def _to_table_id(table_pid: str) -> str:
+        """
+        Convert a StatCan PID to an 8-digit table file ID.
+
+        StatCan PIDs come in two forms:
+          - 10-digit: "3610043401" (full PID including revision suffix)
+          - 8-digit:  "36100434" (table file ID, no revision suffix)
+          - dashed:   "36-10-0434-01" (canonical dash form)
+
+        The bulk CSV download URL uses only the 8-digit form.
+        """
         pid_nodash = table_pid.replace("-", "")
-        return f"{self._base_url}/t1/tbl1/en/dtbl!downloadTbl/csvDownload/{pid_nodash}"
+        return pid_nodash[:8]
+
+    def _csv_zip_url(self, table_pid: str) -> str:
+        """Return the bulk CSV download URL for a StatCan table.
+
+        Format: /n1/tbl/csv/{table_id}-eng.zip
+        where table_id is the 8-digit form (e.g. 36100434).
+        """
+        table_id = self._to_table_id(table_pid)
+        return f"{self._base_url}/n1/tbl/csv/{table_id}-eng.zip"
 
     def _metadata_url(self, table_pid: str) -> str:
-        """WDS endpoint for table metadata."""
-        return f"{self._base_url}/t1/tbl1/en/dtbl!downloadTbl/metadataDownload/{table_pid}"
+        """WDS endpoint for table metadata (JSON format)."""
+        table_id = self._to_table_id(table_pid)
+        return f"{self._base_url}/t1/tbl1/en/dtbl!downloadTbl/metadataDownload/{table_id}"
 
     # ------------------------------------------------------------------
     # DuckDB caching
     # ------------------------------------------------------------------
 
     def _staging_table(self, table_pid: str) -> str:
-        return f"statcan_raw_{table_pid.replace('-', '_')}"
+        table_id = self._to_table_id(table_pid)
+        return f"statcan_raw_{table_id}"
 
     def _is_cached(self, table_pid: str, max_age_hours: int = 24) -> bool:
         """Return True if a recent raw download exists in DuckDB staging."""

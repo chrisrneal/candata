@@ -79,11 +79,13 @@ if [[ -f "packages/api/pyproject.toml" ]] || [[ -f "packages/api/app/main.py" ]]
   info "Starting FastAPI (packages/api)..."
   (
     cd packages/api
+    _log_level="${LOG_LEVEL:-info}"
+    _log_level="${_log_level,,}"  # lowercase for uvicorn
     uvicorn app.main:app \
       --host "${API_HOST:-0.0.0.0}" \
       --port "${API_PORT:-8000}" \
       --reload \
-      --log-level "${LOG_LEVEL:-info}" \
+      --log-level "$_log_level" \
       2>&1 | sed "s/^/$(printf '\033[0;36m')[api]$(printf '\033[0m') /"
   ) &
   PIDS+=($!)
