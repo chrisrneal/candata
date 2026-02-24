@@ -1,18 +1,7 @@
 # Evidence.dev configuration
 # https://docs.evidence.dev/configuration
 
-sources:
-  candata:
-    type: postgres
-    # Connection string loaded from DATABASE_URL env var
-    connection_string: ${DATABASE_URL}
-    # Or specify individual fields:
-    # host: localhost
-    # port: 54322
-    # database: postgres
-    # user: postgres
-    # password: postgres
-    ssl: false
+# Evidence.dev uses sources/candata/connection.yaml for datasource config.
 
 # Output directory for static build
 outDir: build

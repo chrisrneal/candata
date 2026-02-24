@@ -53,7 +53,7 @@ order by ar.ref_date desc
 ## Housing Starts
 
 ```sql starts
-select hs.ref_date, hs.dwelling_type, hs.starts
+select hs.ref_date, hs.dwelling_type, hs.units
 from housing_starts hs
 join geographies g on g.id = hs.geography_id
 where g.name = '{params.cma}'
@@ -63,7 +63,7 @@ order by hs.ref_date desc
 <BarChart
   data={starts}
   x=ref_date
-  y=starts
+  y=units
   series=dwelling_type
   title="Housing Starts"
 />

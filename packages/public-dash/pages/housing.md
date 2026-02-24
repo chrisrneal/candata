@@ -45,7 +45,7 @@ order by avg_vacancy_rate desc
 select g.name as cma, ar.ref_date, ar.bedroom_type, ar.average_rent
 from average_rents ar
 join geographies g on g.id = ar.geography_id
-where ar.bedroom_type = 'total'
+where ar.bedroom_type = '2br'
 order by ar.ref_date desc
 limit 100
 ```
@@ -57,7 +57,7 @@ limit 100
 ## Housing Starts
 
 ```sql starts_overview
-select g.name as cma, hs.ref_date, hs.dwelling_type, hs.starts
+select g.name as cma, hs.ref_date, hs.dwelling_type, hs.units
 from housing_starts hs
 join geographies g on g.id = hs.geography_id
 where hs.dwelling_type = 'total'

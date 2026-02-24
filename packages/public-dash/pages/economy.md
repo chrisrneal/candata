@@ -27,7 +27,7 @@ order by i.name
 select iv.ref_date, iv.value
 from indicator_values iv
 join indicators i on i.id = iv.indicator_id
-where i.indicator_key = 'cpi_monthly'
+where i.id = 'cpi_monthly'
 order by iv.ref_date
 ```
 
@@ -46,7 +46,7 @@ order by iv.ref_date
 select iv.ref_date, iv.value
 from indicator_values iv
 join indicators i on i.id = iv.indicator_id
-where i.indicator_key = 'gdp_monthly'
+where i.id = 'gdp_monthly'
 order by iv.ref_date
 ```
 
@@ -65,7 +65,7 @@ order by iv.ref_date
 select iv.ref_date, iv.value
 from indicator_values iv
 join indicators i on i.id = iv.indicator_id
-where i.indicator_key = 'unemployment_rate'
+where i.id = 'unemployment_rate'
 order by iv.ref_date
 ```
 
