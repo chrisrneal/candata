@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "candata-pipeline"
+version = "0.1.0"
+description = "ETL pipeline workers for the candata platform"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+
+dependencies = [
+    # candata-shared must be installed editably first:
+    #   pip install -e ../../shared/python
+    "candata-shared",
+    "httpx[http2]>=0.27",
+    "polars>=0.20",
+    "structlog>=24.0",
+    "tenacity>=8.3",
+    "anyio>=4.4",
+    "python-dateutil>=2.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "respx>=0.21",
+    "ruff>=0.4",
+    "mypy>=1.10",
+]
+
+[project.scripts]
+pipeline = "candata_pipeline.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/candata_pipeline"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

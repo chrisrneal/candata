@@ -1,0 +1,93 @@
+{
+  "terms": {
+    "url": "https://www.bankofcanada.ca/terms/"
+  },
+  "seriesDetail": {
+    "FXUSDCAD": {
+      "label": "USD/CAD",
+      "description": "US dollar to Canadian dollar daily exchange rate",
+      "dimension": {
+        "key": "d",
+        "name": "Date"
+      }
+    },
+    "V39079": {
+      "label": "Bank Rate",
+      "description": "Bank of Canada bank rate",
+      "dimension": {
+        "key": "d",
+        "name": "Date"
+      }
+    },
+    "V80691338": {
+      "label": "5-year fixed mortgage rate",
+      "description": "Conventional 5-year mortgage rate posted by major chartered banks",
+      "dimension": {
+        "key": "d",
+        "name": "Date"
+      }
+    }
+  },
+  "observations": [
+    {
+      "d": "2023-01-03",
+      "FXUSDCAD": {"v": "1.3544"},
+      "V39079": {"v": "4.50"},
+      "V80691338": {"v": "6.49"}
+    },
+    {
+      "d": "2023-01-04",
+      "FXUSDCAD": {"v": "1.3512"},
+      "V39079": {"v": "4.50"},
+      "V80691338": {"v": "6.49"}
+    },
+    {
+      "d": "2023-01-05",
+      "FXUSDCAD": {"v": "1.3491"},
+      "V39079": {"v": "4.50"},
+      "V80691338": {"v": "6.49"}
+    },
+    {
+      "d": "2023-01-09",
+      "FXUSDCAD": {"v": "1.3455"},
+      "V39079": {"v": "4.50"},
+      "V80691338": {"v": "6.49"}
+    },
+    {
+      "d": "2023-01-10",
+      "FXUSDCAD": {"v": "1.3478"},
+      "V39079": {"v": "4.50"},
+      "V80691338": {"v": "6.75"}
+    },
+    {
+      "d": "2023-01-25",
+      "FXUSDCAD": {"v": "1.3367"},
+      "V39079": {"v": "4.50"},
+      "V80691338": {"v": "6.75"}
+    },
+    {
+      "d": "2023-02-01",
+      "FXUSDCAD": {"v": "1.3305"},
+      "V39079": {"v": "4.50"},
+      "V80691338": {"v": "6.79"}
+    },
+    {
+      "d": "2023-03-08",
+      "FXUSDCAD": {"v": "1.3814"},
+      "V39079": {"v": "4.75"},
+      "V80691338": {"v": "6.79"}
+    },
+    {
+      "d": "2023-04-12",
+      "FXUSDCAD": {"v": "1.3350"},
+      "V39079": {"v": "4.75"},
+      "V80691338": {"v": "6.45"}
+    },
+    {
+      "d": "2023-06-07",
+      "FXUSDCAD": {"v": "1.3393"},
+      "V39079": {"v": "5.00"},
+      "V80691338": {"v": "6.95"}
+    }
+  ]
+}
