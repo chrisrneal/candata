@@ -30,6 +30,7 @@ import structlog
 
 from candata_pipeline.loaders.supabase_loader import LoadResult, SupabaseLoader
 from candata_pipeline.sources.cmhc import (
+    CMA_GEOUIDS,
     CMHC_GEO_NAMES,
     CMHC_GEO_TO_SGC,
     CMA_NAME_TO_CMHC,
@@ -297,7 +298,7 @@ async def run(
     results: dict[str, LoadResult] = {}
 
     try:
-        # Fetch all three datasets in parallel
+        # Fetch all three StatCan datasets in parallel
         vacancy_raw, rents_raw, starts_raw = await asyncio.gather(
             _fetch_dataset(source, "vacancy_rates", normalizer, cmhc_geo_ids, start_date, dry_run=dry_run),
             _fetch_dataset(source, "average_rents", normalizer, cmhc_geo_ids, start_date, dry_run=dry_run),
@@ -312,12 +313,36 @@ async def run(
         # Build indicator_values summary
         indicators_df = _build_indicator_values(vacancy_df, rents_df, starts_df)
 
+        # Fetch CMHC API data (starts/completions/under-construction, all CMAs)
+        log.info("cmhc_api_fetch_start")
+        cmhc_api_df, cmhc_api_errors = await source.extract_cmhc_api(
+            cma_names=cmas,
+        )
+
+        if dry_run and not cmhc_api_df.is_empty():
+            # Group by CMA and print first 5 records per CMA
+            for cma_name in cmhc_api_df["cma_name"].unique().sort().to_list():
+                subset = cmhc_api_df.filter(pl.col("cma_name") == cma_name).head(5)
+                print(f"\n--- {cma_name} (first 5 records) ---")
+                for row in subset.iter_rows(named=True):
+                    print(
+                        f"  {row['year']}-{row['month']:02d} | "
+                        f"{row['dwelling_type']:>9s} | "
+                        f"{row['data_type']:<20s} | "
+                        f"{row['intended_market']:<10s} | "
+                        f"{row['value']}"
+                    )
+
         # Upsert to each table
         tables_to_load: list[tuple[str, pl.DataFrame, list[str]]] = [
             ("vacancy_rates", vacancy_df, ["geography_id", "ref_date", "bedroom_type"]),
             ("average_rents", rents_df, ["geography_id", "ref_date", "bedroom_type"]),
             ("housing_starts", starts_df, ["geography_id", "ref_date", "dwelling_type"]),
             ("indicator_values", indicators_df, ["indicator_id", "geography_id", "ref_date"]),
+            ("cmhc_housing", cmhc_api_df, [
+                "cma_geoid", "year", "month",
+                "dwelling_type", "data_type", "intended_market",
+            ]),
         ]
 
         for table, df, conflict_cols in tables_to_load:
@@ -336,7 +361,7 @@ async def run(
 
         # Summarize
         total_loaded = sum(r.records_loaded for r in results.values())
-        total_failed = sum(r.records_failed for r in results.values())
+        total_failed = sum(r.records_failed for r in results.values()) + cmhc_api_errors
         combined_result = LoadResult(
             table="housing_combined",
             records_loaded=total_loaded,
@@ -345,11 +370,18 @@ async def run(
         if loader and run_id:
             await loader.finish_pipeline_run(run_id, combined_result)
 
+        cmhc_api_n_cmas = len(cmas) if cmas else len(CMA_GEOUIDS)
+        cmhc_api_inserted = results.get("cmhc_housing", LoadResult(table="cmhc_housing")).records_loaded
         log.info(
             "housing_pipeline_complete",
             total_loaded=total_loaded,
             total_failed=total_failed,
             tables={t: r.records_loaded for t, r in results.items()},
+        )
+        print(
+            f"Processed {cmhc_api_n_cmas} CMAs, "
+            f"{cmhc_api_inserted} records inserted, "
+            f"{cmhc_api_errors} errors. See cmhc_errors.log."
         )
 
     except Exception as exc:
