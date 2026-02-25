@@ -241,6 +241,7 @@ async def run_all(args: argparse.Namespace) -> None:
 
     from candata_pipeline.pipelines import economic_pulse, housing, procurement, trade
     from candata_pipeline.pipelines import statcan_trade_hs6
+    from candata_pipeline.pipelines import un_comtrade
 
     pipelines = [
         ("economic-pulse", economic_pulse.run, {
@@ -266,6 +267,10 @@ async def run_all(args: argparse.Namespace) -> None:
             "from_year": args.from_year or 2019,
             "to_year": args.to_year,
             "province": args.province,
+            "dry_run": args.dry_run,
+        }),
+        ("comtrade", un_comtrade.run, {
+            "level": args.level,
             "dry_run": args.dry_run,
         }),
     ]
