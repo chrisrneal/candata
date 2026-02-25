@@ -108,18 +108,21 @@ async def run(
         dry_run=dry_run,
     )
 
-    loader = SupabaseLoader()
     source = TradeSource()
 
-    run_id = await loader.start_pipeline_run(
-        "trade",
-        "StatCan-Trade",
-        metadata={
-            "start_date": str(start_date) if start_date else None,
-            "end_date": str(end_date) if end_date else None,
-            "dry_run": dry_run,
-        },
-    )
+    loader: SupabaseLoader | None = None
+    run_id: str | None = None
+
+    if not dry_run:
+        loader = SupabaseLoader()
+        run_id = await loader.start_pipeline_run(
+            "trade",
+            "StatCan-Trade",
+            metadata={
+                "start_date": str(start_date) if start_date else None,
+                "end_date": str(end_date) if end_date else None,
+            },
+        )
 
     try:
         commodity_result = await _load_commodity_trade(
@@ -134,17 +137,19 @@ async def run(
             records_loaded=commodity_result.records_loaded + bilateral_result.records_loaded,
             records_failed=commodity_result.records_failed + bilateral_result.records_failed,
         )
-        await loader.finish_pipeline_run(
-            run_id,
-            combined,
-            metadata={
-                "commodity_rows": commodity_result.records_loaded,
-                "bilateral_rows": bilateral_result.records_loaded,
-            },
-        )
+        if loader and run_id:
+            await loader.finish_pipeline_run(
+                run_id,
+                combined,
+                metadata={
+                    "commodity_rows": commodity_result.records_loaded,
+                    "bilateral_rows": bilateral_result.records_loaded,
+                },
+            )
 
     except Exception as exc:
-        await loader.fail_pipeline_run(run_id, str(exc))
+        if loader and run_id:
+            await loader.fail_pipeline_run(run_id, str(exc))
         raise
 
     log.info(

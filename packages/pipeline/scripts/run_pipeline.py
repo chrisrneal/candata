@@ -12,11 +12,12 @@ Usage:
     python scripts/run_pipeline.py all --backfill --start-date 2015-01-01
 
 Available pipelines:
-    economic-pulse  — GDP, CPI, employment, interest rates
-    housing         — CMHC vacancy rates, rents, housing starts
-    procurement     — Federal contracts and tenders
-    trade           — Import/export by HS code and province
-    all             — Run all pipelines sequentially
+    economic-pulse       — GDP, CPI, employment, interest rates
+    housing              — CMHC vacancy rates, rents, housing starts
+    housing-enrichment   — NHPI, building permits, Teranet HPI
+    procurement          — Federal contracts and tenders
+    trade                — Import/export by HS code and province
+    all                  — Run all pipelines sequentially
 """
 
 from __future__ import annotations
@@ -44,7 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "pipeline",
-        choices=["economic-pulse", "housing", "procurement", "trade", "trade-hs6", "comtrade", "all"],
+        choices=["economic-pulse", "housing", "housing-enrichment", "procurement", "trade", "trade-hs6", "comtrade", "all"],
         help="Pipeline to run",
     )
     parser.add_argument(
@@ -128,6 +129,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma-separated StatCan table aliases for economic-pulse (gdp,cpi,unemployment,retail)",
     )
     parser.add_argument(
+        "--source",
+        choices=["nhpi", "permits", "teranet", "all"],
+        default="all",
+        help="Housing-enrichment sub-source to run (default: all)",
+    )
+    parser.add_argument(
         "--cmas",
         type=parse_tables,
         default=None,
@@ -175,6 +182,16 @@ async def run_pipeline(args: argparse.Namespace) -> int:
                 year=args.year,
                 start_date=args.start_date,
                 cmas=args.cmas,
+                dry_run=args.dry_run,
+            )
+            total = sum(r.records_loaded for r in results.values())
+            log.info("done", total_records_loaded=total, tables=list(results.keys()))
+
+        elif pipeline == "housing-enrichment":
+            from candata_pipeline.pipelines.housing_enrichment import run
+            results = await run(
+                source=args.source,
+                start_date=args.start_date,
                 dry_run=args.dry_run,
             )
             total = sum(r.records_loaded for r in results.values())
@@ -239,7 +256,7 @@ async def run_all(args: argparse.Namespace) -> None:
     import structlog
     log = structlog.get_logger("run_all")
 
-    from candata_pipeline.pipelines import economic_pulse, housing, procurement, trade
+    from candata_pipeline.pipelines import economic_pulse, housing, housing_enrichment, procurement, trade
     from candata_pipeline.pipelines import statcan_trade_hs6
     from candata_pipeline.pipelines import un_comtrade
 
@@ -253,6 +270,11 @@ async def run_all(args: argparse.Namespace) -> None:
             "year": args.year,
             "start_date": args.start_date,
             "cmas": args.cmas,
+            "dry_run": args.dry_run,
+        }),
+        ("housing-enrichment", housing_enrichment.run, {
+            "source": "all",
+            "start_date": args.start_date,
             "dry_run": args.dry_run,
         }),
         ("procurement", procurement.run, {

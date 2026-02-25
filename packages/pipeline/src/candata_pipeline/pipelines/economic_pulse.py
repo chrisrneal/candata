@@ -201,18 +201,25 @@ async def run(
                 log.warning("unknown_table_filter", table=t)
         active_tables = {k: v for k, v in STATCAN_TABLES.items() if k in resolved_ids}
 
-    loader = SupabaseLoader()
-    geo_lookup = await loader.build_geo_lookup()
+    loader: SupabaseLoader | None = None
+    run_id: str | None = None
 
-    normalizer = GeoNormalizer()
-    normalizer._cache = geo_lookup
-    normalizer._loaded = True
-
-    run_id = await loader.start_pipeline_run(
-        "economic_pulse",
-        "StatCan+BoC",
-        metadata={"start_date": str(start_date), "dry_run": dry_run},
-    )
+    if not dry_run:
+        loader = SupabaseLoader()
+        geo_lookup = await loader.build_geo_lookup()
+        normalizer = GeoNormalizer()
+        normalizer._cache = geo_lookup
+        normalizer._loaded = True
+        run_id = await loader.start_pipeline_run(
+            "economic_pulse",
+            "StatCan+BoC",
+            metadata={"start_date": str(start_date)},
+        )
+    else:
+        geo_lookup: dict[str, str] = {}
+        normalizer = GeoNormalizer()
+        normalizer._cache = geo_lookup
+        normalizer._loaded = True
 
     try:
         # Fetch all StatCan tables + BoC in parallel
@@ -233,6 +240,9 @@ async def run(
                 valid_dfs.append(df_or_exc)
 
         if not valid_dfs:
+            if dry_run:
+                log.warning("dry_run_no_geo_data", msg="No rows survived geo resolution (expected without Supabase)")
+                return LoadResult(table="indicator_values", records_loaded=0)
             raise RuntimeError("All fetch tasks failed — no data to load.")
 
         combined = pl.concat(valid_dfs)
@@ -244,20 +254,20 @@ async def run(
 
         if dry_run:
             log.info("dry_run_complete", rows=len(combined))
-            dummy = LoadResult(table="indicator_values", records_loaded=len(combined))
-            await loader.finish_pipeline_run(run_id, dummy, records_extracted=len(combined))
-            return dummy
+            return LoadResult(table="indicator_values", records_loaded=len(combined))
 
         result = await loader.upsert(
             "indicator_values",
             combined,
             conflict_columns=["indicator_id", "geography_id", "ref_date"],
         )
-        await loader.finish_pipeline_run(
-            run_id, result, records_extracted=len(combined)
-        )
+        if loader and run_id:
+            await loader.finish_pipeline_run(
+                run_id, result, records_extracted=len(combined)
+            )
         return result
 
     except Exception as exc:
-        await loader.fail_pipeline_run(run_id, str(exc))
+        if loader and run_id:
+            await loader.fail_pipeline_run(run_id, str(exc))
         raise

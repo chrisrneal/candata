@@ -178,18 +178,21 @@ async def run(
         dry_run=dry_run,
     )
 
-    loader = SupabaseLoader()
     source = ProcurementSource()
 
-    run_id = await loader.start_pipeline_run(
-        "procurement",
-        "open.canada.ca",
-        metadata={
-            "datasets": datasets,
-            "fiscal_year": fiscal_year,
-            "dry_run": dry_run,
-        },
-    )
+    loader: SupabaseLoader | None = None
+    run_id: str | None = None
+
+    if not dry_run:
+        loader = SupabaseLoader()
+        run_id = await loader.start_pipeline_run(
+            "procurement",
+            "open.canada.ca",
+            metadata={
+                "datasets": datasets,
+                "fiscal_year": fiscal_year,
+            },
+        )
 
     results: dict[str, LoadResult] = {}
     try:
@@ -208,10 +211,12 @@ async def run(
             records_loaded=total_loaded,
             records_failed=total_failed,
         )
-        await loader.finish_pipeline_run(run_id, combined)
+        if loader and run_id:
+            await loader.finish_pipeline_run(run_id, combined)
 
     except Exception as exc:
-        await loader.fail_pipeline_run(run_id, str(exc))
+        if loader and run_id:
+            await loader.fail_pipeline_run(run_id, str(exc))
         raise
 
     return results
