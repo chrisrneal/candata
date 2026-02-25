@@ -44,7 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "pipeline",
-        choices=["economic-pulse", "housing", "procurement", "trade", "trade-hs6", "all"],
+        choices=["economic-pulse", "housing", "procurement", "trade", "trade-hs6", "comtrade", "all"],
         help="Pipeline to run",
     )
     parser.add_argument(
@@ -92,6 +92,26 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="End year for trade-hs6 pipeline (default: current year)",
+    )
+    parser.add_argument(
+        "--level",
+        choices=["hs2", "hs6"],
+        default="hs2",
+        help="Product code level for comtrade pipeline (default: hs2)",
+    )
+    parser.add_argument(
+        "--years",
+        type=str,
+        default=None,
+        metavar="YEARS",
+        help="Years for comtrade pipeline as range (2019-2023) or list (2019,2020)",
+    )
+    parser.add_argument(
+        "--partners",
+        type=str,
+        default=None,
+        metavar="CODES",
+        help="Comma-separated ISO partner codes for comtrade pipeline",
     )
     parser.add_argument(
         "--province",
@@ -185,6 +205,21 @@ async def run_pipeline(args: argparse.Namespace) -> int:
                 from_year=args.from_year or 2019,
                 to_year=args.to_year,
                 province=args.province,
+                dry_run=args.dry_run,
+            )
+            log.info("done", records_loaded=result.records_loaded, status=result.status)
+
+        elif pipeline == "comtrade":
+            from candata_pipeline.pipelines.un_comtrade import run, _parse_int_list
+            comtrade_years = _parse_int_list(args.years) if args.years else None
+            comtrade_partners = (
+                [int(p.strip()) for p in args.partners.split(",")]
+                if args.partners else None
+            )
+            result = await run(
+                level=args.level,
+                partners=comtrade_partners,
+                years=comtrade_years,
                 dry_run=args.dry_run,
             )
             log.info("done", records_loaded=result.records_loaded, status=result.status)
