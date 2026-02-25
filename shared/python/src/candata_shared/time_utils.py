@@ -26,6 +26,8 @@ from typing import Literal
 
 from dateutil.relativedelta import relativedelta
 
+import polars as pl
+
 Frequency = Literal["daily", "weekly", "monthly", "quarterly", "semi-annual", "annual"]
 
 
@@ -126,6 +128,33 @@ def parse_statcan_date(raw: str) -> date | None:
         return date(int(m.group(1)), 1, 1)
 
     return None
+
+
+def parse_statcan_date_expr(col: str = "REF_DATE") -> pl.Expr:
+    """Return a polars expression that parses StatCan date strings vectorially.
+
+    Handles the two dominant formats entirely within the polars engine:
+      - "YYYY-MM"     → date(YYYY, MM, 1)
+      - "YYYY-MM-DD"  → date(YYYY, MM, DD)
+
+    Rows that don't match either pattern (quarterly, annual, text months)
+    fall back to the scalar ``parse_statcan_date`` function via
+    ``map_elements``, but those are typically <1% of rows.
+
+    Usage::
+
+        df = df.with_columns(
+            parse_statcan_date_expr("REF_DATE").alias("ref_date")
+        )
+    """
+    c = pl.col(col).str.strip_chars()
+    return (
+        pl.when(c.str.len_chars() == 10)
+        .then(c.str.to_date("%Y-%m-%d", strict=False))
+        .when(c.str.len_chars() == 7)
+        .then((c + "-01").str.to_date("%Y-%m-%d", strict=False))
+        .otherwise(c.map_elements(parse_statcan_date, return_dtype=pl.Date))
+    )
 
 
 def align_frequency(d: date, frequency: Frequency) -> date:

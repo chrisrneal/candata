@@ -222,12 +222,19 @@ async def run(
         normalizer._loaded = True
 
     try:
-        # Fetch all StatCan tables + BoC in parallel
+        # Fetch StatCan tables sequentially (2 at a time) to limit peak
+        # memory — each table download decompresses a large ZIP in memory.
+        sem = asyncio.Semaphore(2)
+
+        async def _guarded(coro):
+            async with sem:
+                return await coro
+
         tasks = [
-            _fetch_statcan(pid, cfg, normalizer, start_date)
+            _guarded(_fetch_statcan(pid, cfg, normalizer, start_date))
             for pid, cfg in active_tables.items()
         ]
-        tasks.append(_fetch_boc(geo_lookup, start_date, end_date))
+        tasks.append(_guarded(_fetch_boc(geo_lookup, start_date, end_date)))
 
         dfs = await asyncio.gather(*tasks, return_exceptions=True)
 

@@ -17,8 +17,11 @@ from __future__ import annotations
 
 import io
 import re
+import shutil
+import tempfile
 import zipfile
 from datetime import date, datetime
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -66,36 +69,62 @@ _CODE_RE = re.compile(r"\[([A-Z0-9][A-Z0-9.]*)\]\s*$", re.IGNORECASE)
 # ---------------------------------------------------------------------------
 
 @with_retry(max_attempts=3, base_delay=2.0, retry_on=(httpx.HTTPError,))
-async def _download_zip(url: str, timeout: float = 300.0) -> bytes:
-    """Download a URL and return raw bytes."""
+async def _download_zip(url: str, timeout: float = 300.0) -> Path:
+    """Download a URL to a temp file and return its path."""
     log.info("downloading", url=url)
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-        resp = await client.get(url)
-        resp.raise_for_status()
-        return resp.content
+    tmp = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            async with client.stream("GET", url) as resp:
+                resp.raise_for_status()
+                async for chunk in resp.aiter_bytes(chunk_size=256 * 1024):
+                    tmp.write(chunk)
+        tmp.close()
+        return Path(tmp.name)
+    except Exception:
+        tmp.close()
+        Path(tmp.name).unlink(missing_ok=True)
+        raise
 
 
-def _parse_csv_from_zip(zip_bytes: bytes) -> pl.DataFrame:
-    """Extract the data CSV (not MetaData) from a StatCan ZIP bundle."""
-    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-        data_files = [
-            n for n in zf.namelist()
-            if n.endswith(".csv") and "MetaData" not in n
-        ]
-        if not data_files:
-            raise ValueError("No data CSV found in ZIP")
-        raw = zf.read(data_files[0])
+def _parse_csv_from_zip(zip_path: Path) -> pl.DataFrame:
+    """Extract the data CSV (not MetaData) from a StatCan ZIP on disk.
 
-    # Strip UTF-8 BOM
-    if raw.startswith(b"\xef\xbb\xbf"):
-        raw = raw[3:]
+    Streams the CSV entry to a temp file so the full uncompressed
+    content is never held in memory alongside the parsed DataFrame.
+    """
+    csv_tmp_path: Path | None = None
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            data_files = [
+                n for n in zf.namelist()
+                if n.endswith(".csv") and "MetaData" not in n
+            ]
+            if not data_files:
+                raise ValueError("No data CSV found in ZIP")
 
-    return pl.read_csv(
-        io.BytesIO(raw),
-        infer_schema_length=0,       # Read everything as Utf8 first
-        null_values=list(_SUPPRESSED),
-        truncate_ragged_lines=True,
-    )
+            csv_fd = tempfile.NamedTemporaryFile(suffix=".csv", delete=False)
+            csv_tmp_path = Path(csv_fd.name)
+            with zf.open(data_files[0]) as src:
+                shutil.copyfileobj(src, csv_fd, length=256 * 1024)
+            csv_fd.close()
+
+        df = pl.read_csv(
+            csv_tmp_path,
+            infer_schema_length=0,       # Read everything as Utf8 first
+            null_values=list(_SUPPRESSED),
+            truncate_ragged_lines=True,
+        )
+
+        first_col = df.columns[0]
+        if first_col.startswith("\ufeff"):
+            df = df.rename({first_col: first_col.lstrip("\ufeff")})
+
+        return df
+    finally:
+        zip_path.unlink(missing_ok=True)
+        if csv_tmp_path:
+            csv_tmp_path.unlink(missing_ok=True)
 
 
 async def _try_download_concordance() -> pl.DataFrame | None:
@@ -195,10 +224,7 @@ def transform(
     Returns:
         Cleaned DataFrame matching trade_flows_hs6 schema.
     """
-    df = raw.clone()
-
-    # ---- Normalize column names ----
-    df = df.rename({c: c.strip() for c in df.columns})
+    df = raw.rename({c: c.strip() for c in raw.columns})
     log.info("raw_columns", columns=df.columns)
 
     # ---- Identify key columns by pattern matching ----
@@ -293,9 +319,11 @@ def transform(
 
     # ---- NAPCS code + description ----
     if napcs_col:
+        # Vectorized regex extract instead of map_elements
         df = df.with_columns(
             pl.col(napcs_col)
-            .map_elements(_extract_code, return_dtype=pl.String)
+            .str.strip_chars()
+            .str.extract(r"\[([A-Z0-9][A-Z0-9.]*)\]\s*$", 1)
             .alias("napcs_code"),
             pl.col(napcs_col).str.strip_chars().alias("napcs_description"),
         )
@@ -460,8 +488,8 @@ async def run(
     )
 
     # ---- 1. Download bulk CSV ----
-    zip_bytes = await _download_zip(BULK_CSV_URL)
-    raw = _parse_csv_from_zip(zip_bytes)
+    zip_path = await _download_zip(BULK_CSV_URL)
+    raw = _parse_csv_from_zip(zip_path)
     log.info("raw_data_loaded", rows=len(raw), columns=raw.columns)
 
     # ---- 2. Attempt concordance download ----
@@ -475,6 +503,9 @@ async def run(
         province=province,
         concordance=concordance,
     )
+
+    # Free raw data — it can be very large and is no longer needed
+    del raw, concordance
 
     if df.is_empty():
         log.warning("trade_hs6_empty")

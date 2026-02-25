@@ -105,12 +105,13 @@ async def ingest_nhpi(
 
     # Identify the subject columns (names vary by table revision)
     # Expected: "Type of house" and "Components of new housing price indexes"
+    # Some revisions only have one combined column ("NEW HOUSING PRICE INDEXES")
     house_type_col = _find_column(df, ["TYPE OF HOUSE"])
     component_col = _find_column(
         df, ["COMPONENTS OF NEW HOUSING PRICE INDEXES", "NEW HOUSING PRICE INDEXES"]
     )
 
-    if not house_type_col or not component_col:
+    if not component_col:
         log.error(
             "nhpi_missing_columns",
             columns=df.columns,
@@ -119,12 +120,22 @@ async def ingest_nhpi(
         )
         return LoadResult(table="nhpi")
 
+    # Build cma_name + index_component; house_type is optional
     df = df.with_columns(
         pl.col("GEO").str.strip_chars().alias("cma_name"),
-        pl.col(house_type_col).str.strip_chars().alias("house_type"),
         pl.col(component_col).str.strip_chars().alias("index_component"),
         pl.col("VALUE").cast(pl.Float64, strict=False).alias("index_value"),
     )
+
+    if house_type_col:
+        df = df.with_columns(
+            pl.col(house_type_col).str.strip_chars().alias("house_type"),
+        )
+    else:
+        # Single-dimension table — no separate house type column
+        df = df.with_columns(
+            pl.lit("Total").alias("house_type"),
+        )
 
     # Keep only rows with a numeric value
     df = df.filter(pl.col("index_value").is_not_null())
@@ -163,8 +174,17 @@ async def ingest_permits(
     """
     log.info("permits_start")
 
+    # Only fetch the columns we actually need — the full permits table
+    # has millions of rows and loading all ~17 columns causes OOM.
+    _PERMITS_COLUMNS = [
+        "REF_DATE", "GEO", "DGUID",
+        "Type of structure", "Type of work", "VALUE",
+    ]
     source = StatCanSource(timeout=300.0)  # large table
-    raw = await source.extract(table_pid=_PERMITS_PID)
+    raw = await source.extract(
+        table_pid=_PERMITS_PID,
+        columns=_PERMITS_COLUMNS,
+    )
 
     raw = raw.rename({c: c.strip().upper() for c in raw.columns})
 
@@ -351,50 +371,55 @@ def _parse_teranet_date(df: pl.DataFrame, date_col: str) -> pl.DataFrame:
     """
     Parse various date formats from the Teranet CSV into year/month ints.
 
+    Uses vectorized polars string operations for the common formats
+    (YYYY-MM, MM/YYYY) and only falls back to Python for month-name
+    strings.
+
     Handles:
       - "YYYY-MM" or "YYYY-MM-DD"
       - "MM/YYYY" or "M/YYYY"
       - "Jan-2000", "January 2000"
     """
-    import re
+    c = pl.col(date_col).str.strip_chars()
 
-    def _extract_ym(raw: str | None) -> tuple[int | None, int | None]:
-        if not raw:
-            return (None, None)
-        raw = raw.strip()
-        # YYYY-MM or YYYY-MM-DD
-        m = re.match(r"^(\d{4})-(\d{1,2})", raw)
-        if m:
-            return (int(m.group(1)), int(m.group(2)))
-        # MM/YYYY
-        m = re.match(r"^(\d{1,2})/(\d{4})$", raw)
-        if m:
-            return (int(m.group(2)), int(m.group(1)))
-        # Mon-YYYY or Month YYYY
-        _MONTHS = {
-            "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
-            "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
-            "january": 1, "february": 2, "march": 3, "april": 4,
-            "june": 6, "july": 7, "august": 8, "september": 9,
-            "october": 10, "november": 11, "december": 12,
-        }
-        m = re.match(r"^([A-Za-z]+)[\s\-]+(\d{4})$", raw)
-        if m:
-            mon = _MONTHS.get(m.group(1).lower())
-            if mon:
-                return (int(m.group(2)), mon)
-        return (None, None)
+    # Try YYYY-MM or YYYY-MM-DD first (vectorized)
+    year_ym = c.str.extract(r"^(\d{4})-(\d{1,2})", 1).cast(pl.Int32, strict=False)
+    month_ym = c.str.extract(r"^(\d{4})-(\d{1,2})", 2).cast(pl.Int32, strict=False)
 
-    years: list[int | None] = []
-    months: list[int | None] = []
-    for val in df[date_col].to_list():
-        y, m = _extract_ym(val)
-        years.append(y)
-        months.append(m)
+    # Try MM/YYYY
+    year_slash = c.str.extract(r"^(\d{1,2})/(\d{4})$", 2).cast(pl.Int32, strict=False)
+    month_slash = c.str.extract(r"^(\d{1,2})/(\d{4})$", 1).cast(pl.Int32, strict=False)
+
+    # Build month-name lookup for Mon-YYYY / Month YYYY patterns
+    _MONTHS = {
+        "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+        "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+        "january": 1, "february": 2, "march": 3, "april": 4,
+        "june": 6, "july": 7, "august": 8, "september": 9,
+        "october": 10, "november": 11, "december": 12,
+    }
+    year_text = c.str.extract(r"^[A-Za-z]+[\s\-]+(\d{4})$", 1).cast(pl.Int32, strict=False)
+    month_name_raw = c.str.extract(r"^([A-Za-z]+)[\s\-]+\d{4}$", 1).str.to_lowercase()
+
+    # Resolve month names via a small join instead of row-by-row Python
+    unique_names = df.select(
+        c.str.extract(r"^([A-Za-z]+)[\s\-]+\d{4}$", 1)
+        .str.to_lowercase()
+        .unique()
+        .drop_nulls()
+        .alias("_mn")
+    ).to_series().to_list()
+    name_lookup = {n: _MONTHS.get(n) for n in unique_names if n in _MONTHS}
+
+    # Build a replace expression for known month names
+    month_text = month_name_raw
+    for name, num in name_lookup.items():
+        month_text = month_text.replace(name, str(num))
+    month_text = month_text.cast(pl.Int32, strict=False)
 
     return df.with_columns(
-        pl.Series("year", years, dtype=pl.Int32),
-        pl.Series("month", months, dtype=pl.Int32),
+        pl.coalesce([year_ym, year_slash, year_text]).alias("year"),
+        pl.coalesce([month_ym, month_slash, month_text]).alias("month"),
     )
 
 
@@ -474,7 +499,18 @@ async def run(
         "teranet": ingest_teranet,
     }
 
+    connection_dead = False
+
     for table_name, source_key in runners:
+        if connection_dead:
+            log.warning(
+                "source_skipped_connection_dead",
+                table=table_name,
+                reason="Previous source failed due to connection error; skipping remaining sources.",
+            )
+            results[table_name] = LoadResult(table=table_name)
+            continue
+
         try:
             result = await ingest_map[source_key](**kwargs)
             results[table_name] = result
@@ -484,6 +520,18 @@ async def run(
                 records_loaded=result.records_loaded,
                 status=result.status,
             )
+            # If every record failed, check whether it looks like a connection issue
+            if (
+                result.records_loaded == 0
+                and result.records_failed > 0
+                and any("Connection refused" in e for e in result.errors)
+            ):
+                connection_dead = True
+                log.error(
+                    "connection_dead_detected",
+                    table=table_name,
+                    hint="All records failed with connection errors; aborting remaining sources.",
+                )
         except Exception as exc:
             log.error("source_failed", table=table_name, error=str(exc), exc_info=True)
             results[table_name] = LoadResult(table=table_name)

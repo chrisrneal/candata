@@ -562,7 +562,6 @@ async def run(
 
     api_key = _get_api_key()
     limiter = RateLimiter(per_second=1, per_hour=500)
-    all_records: list[dict[str, Any]] = []
 
     period_str = ",".join(str(y) for y in years)
 
@@ -573,6 +572,60 @@ async def run(
         partners=partners,
         dry_run=dry_run,
     )
+
+    # ---- Setup loader for incremental upserts ----
+    loader: SupabaseLoader | None = None
+    run_id: str | None = None
+    combined_result = LoadResult(table=TABLE_NAME)
+
+    if not dry_run:
+        loader = SupabaseLoader()
+        run_id = await loader.start_pipeline_run(
+            "un_comtrade",
+            "UN-Comtrade",
+            metadata={
+                "level": level,
+                "years": years,
+                "partners": partners,
+            },
+        )
+
+    # Max records to buffer before flushing — keeps memory bounded.
+    # At HS6 level each record is ~300 bytes so 50k records ≈ 15 MB.
+    FLUSH_THRESHOLD = 50_000
+    buffer: list[dict[str, Any]] = []
+    total_records_fetched = 0
+    dry_run_dfs: list[pl.DataFrame] = []
+
+    async def _flush_buffer(records: list[dict[str, Any]]) -> None:
+        """Transform buffered records and upsert (or collect for dry-run)."""
+        nonlocal combined_result
+        if not records:
+            return
+
+        df = _records_to_dataframe(records)
+        df = df.with_columns(
+            pl.col("hs6_code").fill_null("").alias("hs6_code"),
+        )
+        df = df.unique(subset=CONFLICT_COLUMNS, keep="last")
+
+        if dry_run:
+            dry_run_dfs.append(df)
+        else:
+            batch_result = await loader.upsert(
+                TABLE_NAME, df, conflict_columns=CONFLICT_COLUMNS,
+            )
+            combined_result.records_loaded += batch_result.records_loaded
+            combined_result.records_failed += batch_result.records_failed
+            combined_result.batches_total += batch_result.batches_total
+            combined_result.batches_failed += batch_result.batches_failed
+            combined_result.errors.extend(batch_result.errors)
+
+        log.info(
+            "comtrade_buffer_flushed",
+            buffered_records=len(records),
+            transformed_rows=len(df),
+        )
 
     async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
         for partner_code in partners:
@@ -595,7 +648,8 @@ async def run(
                         cmd_code="AG2",   # All HS2-digit chapters
                         api_key=api_key,
                     )
-                    all_records.extend(data)
+                    buffer.extend(data)
+                    total_records_fetched += len(data)
                     log.info(
                         "comtrade_fetched",
                         partner=partner_name,
@@ -622,39 +676,46 @@ async def run(
                             cmd_code=chapter,
                             api_key=api_key,
                         )
-                        all_records.extend(data)
+                        buffer.extend(data)
+                        total_records_fetched += len(data)
+
+                        # Flush when buffer exceeds threshold
+                        if len(buffer) >= FLUSH_THRESHOLD:
+                            await _flush_buffer(buffer)
+                            buffer.clear()
+
+    # Flush remaining records
+    await _flush_buffer(buffer)
+    buffer.clear()
 
     log.info(
         "comtrade_fetch_complete",
-        total_records=len(all_records),
+        total_records=total_records_fetched,
         api_calls=limiter.total_calls,
     )
 
-    if not all_records:
+    if total_records_fetched == 0:
         log.warning("comtrade_no_data")
-        return LoadResult(table=TABLE_NAME)
-
-    # Transform
-    df = _records_to_dataframe(all_records)
-
-    # Fill empty hs6_code with empty string for the unique constraint
-    df = df.with_columns(
-        pl.col("hs6_code").fill_null("").alias("hs6_code"),
-    )
-
-    # Deduplicate
-    df = df.unique(subset=CONFLICT_COLUMNS, keep="last")
-
-    log.info(
-        "comtrade_transform_complete",
-        rows=len(df),
-        unique_hs2=df["hs2_code"].n_unique(),
-        year_range=f"{df['period_year'].min()}-{df['period_year'].max()}"
-        if not df.is_empty() else "empty",
-    )
+        if loader and run_id:
+            await loader.finish_pipeline_run(run_id, combined_result)
+        return combined_result
 
     # Dry-run output
     if dry_run:
+        df = pl.concat(dry_run_dfs) if dry_run_dfs else pl.DataFrame()
+        dry_run_dfs.clear()
+
+        if not df.is_empty():
+            df = df.unique(subset=CONFLICT_COLUMNS, keep="last")
+
+        log.info(
+            "comtrade_transform_complete",
+            rows=len(df),
+            unique_hs2=df["hs2_code"].n_unique() if not df.is_empty() else 0,
+            year_range=f"{df['period_year'].min()}-{df['period_year'].max()}"
+            if not df.is_empty() else "empty",
+        )
+
         print("\n=== DRY RUN — first 20 rows ===")
         with pl.Config(tbl_cols=-1, tbl_rows=20, fmt_str_lengths=60):
             print(df.head(20))
@@ -677,47 +738,32 @@ async def run(
 
         return LoadResult(table=TABLE_NAME, records_loaded=len(df))
 
-    # Upsert to Supabase
-    loader = SupabaseLoader()
-    run_id = await loader.start_pipeline_run(
-        "un_comtrade",
-        "UN-Comtrade",
-        metadata={
-            "level": level,
-            "years": years,
-            "partners": partners,
-        },
-    )
-
+    # Finish pipeline run
     try:
-        result = await loader.upsert(
-            TABLE_NAME, df, conflict_columns=CONFLICT_COLUMNS,
-        )
-        await loader.finish_pipeline_run(
-            run_id, result,
-            metadata={
-                "rows": result.records_loaded,
-                "api_calls": limiter.total_calls,
-            },
-        )
+        combined_result.duration_ms = int(combined_result.duration_ms)
+        if loader and run_id:
+            await loader.finish_pipeline_run(
+                run_id, combined_result,
+                metadata={
+                    "rows": combined_result.records_loaded,
+                    "api_calls": limiter.total_calls,
+                },
+            )
     except Exception as exc:
-        await loader.fail_pipeline_run(run_id, str(exc))
+        if loader and run_id:
+            await loader.fail_pipeline_run(run_id, str(exc))
         raise
 
     # Print summary
-    total_import = df.filter(pl.col("flow") == "Import")["value_usd"].sum()
-    total_export = df.filter(pl.col("flow") == "Export")["value_usd"].sum()
-    print(f"\nLoaded {result.records_loaded} records to {TABLE_NAME}.")
-    print(f"Total import value: ${total_import/1e9:,.1f}B USD")
-    print(f"Total export value: ${total_export/1e9:,.1f}B USD")
+    print(f"\nLoaded {combined_result.records_loaded} records to {TABLE_NAME}.")
 
     log.info(
         "comtrade_pipeline_complete",
-        records_loaded=result.records_loaded,
-        records_failed=result.records_failed,
-        status=result.status,
+        records_loaded=combined_result.records_loaded,
+        records_failed=combined_result.records_failed,
+        status=combined_result.status,
     )
-    return result
+    return combined_result
 
 
 # ---------------------------------------------------------------------------

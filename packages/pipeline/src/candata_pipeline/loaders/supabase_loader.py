@@ -50,6 +50,10 @@ log = structlog.get_logger(__name__)
 
 BATCH_SIZE = 500     # rows per Supabase request
 MAX_PAYLOAD_MB = 4   # stay under Supabase's 5 MB limit
+MAX_CONSECUTIVE_FAILURES = 3  # abort upsert after N consecutive batch failures
+
+# Errors that indicate the server is unreachable (no point retrying)
+_CONNECTION_ERROR_PATTERNS = ("Connection refused", "Name or service not known", "Network is unreachable")
 
 
 @dataclass
@@ -126,16 +130,41 @@ class SupabaseLoader:
         loader_log = log.bind(table=table, total_rows=len(df))
         loader_log.info("upsert_start")
 
-        # Convert DataFrame to JSON-serialisable dicts
-        rows = self._to_dicts(df, ignore_columns=ignore_columns or [])
+        # Prepare the DataFrame once (cast dates to strings, drop ignored cols)
+        ignore_set = set(ignore_columns or [])
+        cols = [c for c in df.columns if c not in ignore_set]
+        df_prepared = df.select(cols)
 
-        # Split into batches
-        n_batches = math.ceil(len(rows) / self._batch_size)
+        cast_exprs = []
+        for col_name in df_prepared.columns:
+            dtype = df_prepared[col_name].dtype
+            if dtype == pl.Date:
+                cast_exprs.append(pl.col(col_name).cast(pl.String).alias(col_name))
+            elif dtype == pl.Datetime:
+                cast_exprs.append(
+                    pl.col(col_name).dt.strftime("%Y-%m-%dT%H:%M:%SZ").alias(col_name)
+                )
+        if cast_exprs:
+            df_prepared = df_prepared.with_columns(cast_exprs)
+
+        # Batch directly from the DataFrame — convert only one batch
+        # at a time to dicts instead of materializing the entire DataFrame.
+        n_rows = len(df_prepared)
+        n_batches = math.ceil(n_rows / self._batch_size)
         result.batches_total = n_batches
+
+        consecutive_failures = 0
 
         for batch_idx in range(n_batches):
             start = batch_idx * self._batch_size
-            batch = rows[start : start + self._batch_size]
+            end = min(start + self._batch_size, n_rows)
+            batch_df = df_prepared.slice(start, end - start)
+
+            # Convert only this slice to dicts, stripping nulls
+            batch = [
+                {k: v for k, v in row.items() if v is not None}
+                for row in batch_df.to_dicts()
+            ]
 
             try:
                 self._client.table(table).upsert(
@@ -143,6 +172,7 @@ class SupabaseLoader:
                     on_conflict=",".join(conflict_columns),
                 ).execute()
                 result.records_loaded += len(batch)
+                consecutive_failures = 0
                 loader_log.debug(
                     "batch_loaded",
                     batch=batch_idx + 1,
@@ -155,6 +185,23 @@ class SupabaseLoader:
                 result.records_failed += len(batch)
                 result.batches_failed += 1
                 result.errors.append(error_msg)
+                consecutive_failures += 1
+
+                # Abort early on connection-level errors to avoid
+                # hammering an unreachable server for thousands of batches.
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES and _is_connection_error(
+                    str(exc)
+                ):
+                    remaining = n_rows - end
+                    result.records_failed += remaining
+                    log.error(
+                        "upsert_aborted_connection_error",
+                        table=table,
+                        consecutive_failures=consecutive_failures,
+                        remaining_rows=remaining,
+                        error=str(exc),
+                    )
+                    break
 
         result.duration_ms = int((time.monotonic() - t0) * 1000)
         loader_log.info(
@@ -282,6 +329,15 @@ class SupabaseLoader:
     # Helpers
     # ------------------------------------------------------------------
 
+    @property
+    def connection_ok(self) -> bool:
+        """Quick connectivity check — attempt a lightweight query."""
+        try:
+            self._client.table("geographies").select("id").limit(1).execute()
+            return True
+        except Exception:
+            return False
+
     @staticmethod
     def _to_dicts(
         df: pl.DataFrame,
@@ -316,3 +372,8 @@ class SupabaseLoader:
 
         # Strip nulls from each dict
         return [{k: v for k, v in row.items() if v is not None} for row in raw]
+
+
+def _is_connection_error(error_str: str) -> bool:
+    """Return True if the error string indicates a connection-level failure."""
+    return any(p in error_str for p in _CONNECTION_ERROR_PATTERNS)

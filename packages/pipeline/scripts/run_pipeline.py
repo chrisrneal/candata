@@ -297,6 +297,20 @@ async def run_all(args: argparse.Namespace) -> None:
         }),
     ]
 
+    # Gate: verify Supabase connectivity before running any pipeline
+    if not args.dry_run:
+        from candata_pipeline.loaders.supabase_loader import SupabaseLoader
+        loader = SupabaseLoader()
+        if not loader.connection_ok:
+            log.error(
+                "supabase_unreachable",
+                hint="Supabase is not reachable — aborting all pipelines. "
+                     "Start Supabase with `supabase start` or check SUPABASE_URL.",
+            )
+            return
+
+    _CONNECTION_ERRORS = ("Connection refused", "Name or service not known", "Network is unreachable")
+
     for name, runner, kwargs in pipelines:
         log.info("starting_pipeline", pipeline=name)
         try:
@@ -307,8 +321,14 @@ async def run_all(args: argparse.Namespace) -> None:
             else:
                 log.info("pipeline_done", pipeline=name, records_loaded=result.records_loaded)
         except Exception as exc:
-            log.error("pipeline_error", pipeline=name, error=str(exc))
-            # Continue with remaining pipelines
+            error_str = str(exc)
+            log.error("pipeline_error", pipeline=name, error=error_str)
+            if any(pat in error_str for pat in _CONNECTION_ERRORS):
+                log.error(
+                    "aborting_remaining_pipelines",
+                    reason="Connection-level error detected; remaining pipelines would also fail.",
+                )
+                break
 
 
 def main() -> None:

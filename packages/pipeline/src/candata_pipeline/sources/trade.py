@@ -16,10 +16,12 @@ Usage:
 
 from __future__ import annotations
 
-import io
 import re
+import shutil
+import tempfile
 import zipfile
 from datetime import date
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -27,8 +29,8 @@ import polars as pl
 import structlog
 
 from candata_shared.config import settings
-from candata_shared.geo import normalize_statcan_geo
-from candata_shared.time_utils import parse_statcan_date
+from candata_shared.geo import normalize_geo_column, normalize_statcan_geo
+from candata_shared.time_utils import parse_statcan_date, parse_statcan_date_expr
 from candata_pipeline.sources.base import BaseSource
 from candata_pipeline.utils.retry import with_retry
 
@@ -118,34 +120,63 @@ class TradeSource(BaseSource):
         return f"{self._base_url}/n1/tbl/csv/{table_id}-eng.zip"
 
     @with_retry(max_attempts=3, base_delay=2.0, retry_on=(httpx.HTTPError,))
-    async def _download_csv_zip(self, table_pid: str) -> bytes:
+    async def _download_csv_zip(self, table_pid: str) -> Path:
+        """Download a StatCan trade ZIP to a temp file and return its path."""
         url = self._csv_zip_url(table_pid)
         self._log.info("downloading", url=url, table_pid=table_pid)
-        async with httpx.AsyncClient(timeout=self._timeout, follow_redirects=True) as client:
-            response = await client.get(url)
-            response.raise_for_status()
-            return response.content
+        tmp = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout, follow_redirects=True) as client:
+                async with client.stream("GET", url) as response:
+                    response.raise_for_status()
+                    async for chunk in response.aiter_bytes(chunk_size=256 * 1024):
+                        tmp.write(chunk)
+            tmp.close()
+            return Path(tmp.name)
+        except Exception:
+            tmp.close()
+            Path(tmp.name).unlink(missing_ok=True)
+            raise
 
     @staticmethod
-    def _parse_csv_zip(zip_bytes: bytes, table_pid: str) -> pl.DataFrame:
-        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-            data_files = [
-                n for n in zf.namelist()
-                if n.endswith(".csv") and "MetaData" not in n
-            ]
-            if not data_files:
-                raise ValueError(f"No data CSV found in trade zip for pid={table_pid}")
-            raw_bytes = zf.read(data_files[0])
+    def _parse_csv_zip(zip_path: Path, table_pid: str) -> pl.DataFrame:
+        """Extract and parse the data CSV from a StatCan ZIP on disk.
 
-        if raw_bytes.startswith(b"\xef\xbb\xbf"):
-            raw_bytes = raw_bytes[3:]
+        Streams the CSV entry to a temp file so the full uncompressed
+        content is never held in memory alongside the parsed DataFrame.
+        """
+        csv_tmp_path: Path | None = None
+        try:
+            with zipfile.ZipFile(zip_path) as zf:
+                data_files = [
+                    n for n in zf.namelist()
+                    if n.endswith(".csv") and "MetaData" not in n
+                ]
+                if not data_files:
+                    raise ValueError(f"No data CSV found in trade zip for pid={table_pid}")
 
-        return pl.read_csv(
-            io.BytesIO(raw_bytes),
-            infer_schema_length=0,
-            null_values=list(_SUPPRESSED),
-            truncate_ragged_lines=True,
-        )
+                csv_fd = tempfile.NamedTemporaryFile(suffix=".csv", delete=False)
+                csv_tmp_path = Path(csv_fd.name)
+                with zf.open(data_files[0]) as src:
+                    shutil.copyfileobj(src, csv_fd, length=256 * 1024)
+                csv_fd.close()
+
+            df = pl.read_csv(
+                csv_tmp_path,
+                infer_schema_length=0,
+                null_values=list(_SUPPRESSED),
+                truncate_ragged_lines=True,
+            )
+
+            first_col = df.columns[0]
+            if first_col.startswith("\ufeff"):
+                df = df.rename({first_col: first_col.lstrip("\ufeff")})
+
+            return df
+        finally:
+            zip_path.unlink(missing_ok=True)
+            if csv_tmp_path:
+                csv_tmp_path.unlink(missing_ok=True)
 
     # ------------------------------------------------------------------
     # BaseSource interface
@@ -157,8 +188,8 @@ class TradeSource(BaseSource):
         Args:
             table_pid: StatCan table ID. Default is 12-10-0011 (commodity trade).
         """
-        zip_bytes = await self._download_csv_zip(table_pid)
-        return self._parse_csv_zip(zip_bytes, table_pid)
+        zip_path = await self._download_csv_zip(table_pid)
+        return self._parse_csv_zip(zip_path, table_pid)
 
     def transform(
         self,
@@ -180,10 +211,9 @@ class TradeSource(BaseSource):
             volume          — physical volume (if UOM is weight/units)
             volume_unit     — unit of measure for volume
         """
-        df = raw.clone()
-
-        # Standardize column names to uppercase
-        df = df.rename({col: col.strip().upper() for col in df.columns})
+        # Operate on the input directly — polars expressions create new
+        # DataFrames so there is no need for an expensive deep copy.
+        df = raw.rename({col: col.strip().upper() for col in raw.columns})
 
         if "REF_DATE" not in df.columns:
             raise ValueError(f"REF_DATE column not found. Columns: {df.columns}")
@@ -192,9 +222,7 @@ class TradeSource(BaseSource):
         df = df.filter(
             pl.col("REF_DATE").is_not_null() & (pl.col("REF_DATE") != "")
         ).with_columns(
-            pl.col("REF_DATE")
-            .map_elements(parse_statcan_date, return_dtype=pl.Date)
-            .alias("ref_date")
+            parse_statcan_date_expr("REF_DATE").alias("ref_date")
         ).filter(pl.col("ref_date").is_not_null())
 
         if start_date:
@@ -213,7 +241,7 @@ class TradeSource(BaseSource):
         else:
             df = df.with_columns(pl.lit("export").alias("direction"))
 
-        # Extract HS code from NAPCS description
+        # Extract HS code using vectorized regex instead of map_elements
         napcs_col = next(
             (c for c in df.columns if "NAPCS" in c.upper() or "PRODUCT" in c.upper() or "COMMODITY" in c.upper()),
             None,
@@ -221,7 +249,8 @@ class TradeSource(BaseSource):
         if napcs_col:
             df = df.with_columns(
                 pl.col(napcs_col)
-                .map_elements(extract_hs_code, return_dtype=pl.String)
+                .str.strip_chars()
+                .str.extract(r"^\[?(\d{2,10})\]?\s*[-\u2013]", 1)
                 .alias("hs_code"),
                 pl.col(napcs_col).alias("hs_description"),
             )
@@ -234,37 +263,32 @@ class TradeSource(BaseSource):
         # Drop rows without HS code (aggregate/total rows)
         df = df.filter(pl.col("hs_code").is_not_null())
 
-        # Normalize GEO → province SGC code
-        def geo_to_province(geo: str | None) -> str | None:
-            if not geo:
-                return None
-            result = normalize_statcan_geo(geo)
-            if not result:
-                return None
-            level, code = result
-            if level in ("country", "pr"):
-                return code
-            return None
-
+        # Normalize GEO → province SGC code using batch lookup
         if "GEO" in df.columns:
+            df = normalize_geo_column(df, "GEO")
+            # Keep only country/province level rows as province
             df = df.with_columns(
-                pl.col("GEO")
-                .map_elements(geo_to_province, return_dtype=pl.String)
+                pl.when(pl.col("geo_level").is_in(["country", "pr"]))
+                .then(pl.col("sgc_code"))
+                .otherwise(pl.lit(None))
                 .alias("province")
             )
+            df = df.drop(["sgc_code", "geo_level"])
         else:
             df = df.with_columns(pl.lit("01").alias("province"))
 
         df = df.filter(pl.col("province").is_not_null())
 
         # Partner country: commodity table is all-countries aggregate
+        # Use a batch lookup via join instead of row-by-row map_elements
         if "PARTNER" in " ".join(df.columns).upper():
             partner_col = next(c for c in df.columns if "PARTNER" in c.upper())
-            df = df.with_columns(
-                pl.col(partner_col)
-                .map_elements(normalize_country, return_dtype=pl.String)
-                .alias("partner_country")
-            )
+            unique_partners = df.select(pl.col(partner_col).unique().drop_nulls()).to_series().to_list()
+            partner_lookup = pl.DataFrame({
+                partner_col: unique_partners,
+                "partner_country": [normalize_country(p) for p in unique_partners],
+            })
+            df = df.join(partner_lookup, on=partner_col, how="left")
         else:
             df = df.with_columns(pl.lit("WLD").alias("partner_country"))
 
@@ -309,8 +333,7 @@ class TradeSource(BaseSource):
 
         Same output schema as transform(), but with real partner_country values.
         """
-        df = raw.clone()
-        df = df.rename({col: col.strip().upper() for col in df.columns})
+        df = raw.rename({col: col.strip().upper() for col in raw.columns})
 
         if "REF_DATE" not in df.columns:
             raise ValueError(f"REF_DATE column not found. Columns: {df.columns}")
@@ -319,9 +342,7 @@ class TradeSource(BaseSource):
         df = df.filter(
             pl.col("REF_DATE").is_not_null() & (pl.col("REF_DATE") != "")
         ).with_columns(
-            pl.col("REF_DATE")
-            .map_elements(parse_statcan_date, return_dtype=pl.Date)
-            .alias("ref_date")
+            parse_statcan_date_expr("REF_DATE").alias("ref_date")
         ).filter(pl.col("ref_date").is_not_null())
 
         if start_date:
@@ -340,7 +361,7 @@ class TradeSource(BaseSource):
         else:
             df = df.with_columns(pl.lit("export").alias("direction"))
 
-        # HS code from NAPCS/commodity column
+        # HS code from NAPCS/commodity column — vectorized regex
         napcs_col = next(
             (c for c in df.columns if "NAPCS" in c.upper() or "PRODUCT" in c.upper() or "COMMODITY" in c.upper()),
             None,
@@ -348,7 +369,8 @@ class TradeSource(BaseSource):
         if napcs_col:
             df = df.with_columns(
                 pl.col(napcs_col)
-                .map_elements(extract_hs_code, return_dtype=pl.String)
+                .str.strip_chars()
+                .str.extract(r"^\[?(\d{2,10})\]?\s*[-\u2013]", 1)
                 .alias("hs_code"),
                 pl.col(napcs_col).alias("hs_description"),
             )
@@ -360,40 +382,33 @@ class TradeSource(BaseSource):
 
         df = df.filter(pl.col("hs_code").is_not_null())
 
-        # Province
-        def geo_to_province(geo: str | None) -> str | None:
-            if not geo:
-                return None
-            result = normalize_statcan_geo(geo)
-            if not result:
-                return None
-            level, code = result
-            if level in ("country", "pr"):
-                return code
-            return None
-
+        # Province — batch geo lookup
         if "GEO" in df.columns:
+            df = normalize_geo_column(df, "GEO")
             df = df.with_columns(
-                pl.col("GEO")
-                .map_elements(geo_to_province, return_dtype=pl.String)
+                pl.when(pl.col("geo_level").is_in(["country", "pr"]))
+                .then(pl.col("sgc_code"))
+                .otherwise(pl.lit(None))
                 .alias("province")
             )
+            df = df.drop(["sgc_code", "geo_level"])
         else:
             df = df.with_columns(pl.lit("01").alias("province"))
 
         df = df.filter(pl.col("province").is_not_null())
 
-        # Partner country
+        # Partner country — batch lookup
         partner_col = next(
             (c for c in df.columns if "PARTNER" in c.upper() or "TRADING" in c.upper()),
             None,
         )
         if partner_col:
-            df = df.with_columns(
-                pl.col(partner_col)
-                .map_elements(normalize_country, return_dtype=pl.String)
-                .alias("partner_country")
-            )
+            unique_partners = df.select(pl.col(partner_col).unique().drop_nulls()).to_series().to_list()
+            partner_lookup = pl.DataFrame({
+                partner_col: unique_partners,
+                "partner_country": [normalize_country(p) for p in unique_partners],
+            })
+            df = df.join(partner_lookup, on=partner_col, how="left")
         else:
             df = df.with_columns(pl.lit("WLD").alias("partner_country"))
 

@@ -26,7 +26,6 @@ Usage:
 from __future__ import annotations
 
 import io
-import json
 import re
 from typing import Any, Literal
 
@@ -359,29 +358,38 @@ class ProcurementSource(BaseSource):
         col_end = pick(["delivery_date", "end_date"])
         col_econ = pick(["economic_object_code"])
 
-        # Serialize each row as JSON string for raw_data
-        raw_json = [json.dumps(row, default=str) for row in df.to_dicts()]
-
         exprs: list[pl.Expr] = []
         col_mapping: dict[str, str] = {}
 
         if col_ref:
             exprs.append(pl.col(col_ref).alias("contract_number"))
             col_mapping["contract_number"] = col_ref
+
+        # Vectorized vendor normalization: strip, collapse whitespace, title-case
         if col_vendor:
             exprs.append(
                 pl.col(col_vendor)
-                .map_elements(normalize_vendor, return_dtype=pl.String)
+                .str.strip_chars()
+                .str.replace_all(r"\s+", " ")
+                .str.to_titlecase()
                 .alias("vendor_name")
             )
             col_mapping["vendor_name"] = col_vendor
+
+        # Department normalization via batch lookup
         if col_dept:
-            exprs.append(
-                pl.col(col_dept)
-                .map_elements(normalize_department, return_dtype=pl.String)
-                .alias("department")
-            )
+            unique_depts = df.select(pl.col(col_dept).unique().drop_nulls()).to_series().to_list()
+            norm_col = "__dept_normalized"
+            dept_lookup = pl.DataFrame({
+                col_dept: unique_depts,
+                norm_col: [normalize_department(d) for d in unique_depts],
+            })
+            df = df.join(dept_lookup, on=col_dept, how="left").with_columns(
+                pl.col(norm_col).alias("department")
+            ).drop(norm_col)
+            # Don't add to exprs — already a column
             col_mapping["department"] = col_dept
+
         if col_desc:
             exprs.append(pl.col(col_desc).alias("description"))
             col_mapping["description"] = col_desc
@@ -413,25 +421,36 @@ class ProcurementSource(BaseSource):
             exprs.append(
                 pl.col(col_end).str.to_date(strict=False).alias("end_date")
             )
-        if col_econ:
-            exprs.append(
-                pl.col(col_econ)
-                .map_elements(categorize_economic_object, return_dtype=pl.String)
-                .alias("category")
-            )
 
-        if not exprs:
+        # Economic object category via batch lookup
+        if col_econ:
+            unique_codes = df.select(pl.col(col_econ).unique().drop_nulls()).to_series().to_list()
+            econ_lookup = pl.DataFrame({
+                col_econ: unique_codes,
+                "category": [categorize_economic_object(c) for c in unique_codes],
+            })
+            df = df.join(econ_lookup, on=col_econ, how="left")
+
+        if not exprs and not col_dept and not col_econ:
             return df
 
-        result = df.with_columns(exprs)
+        result = df.with_columns(exprs) if exprs else df
 
         # Select only the output columns
         output_cols = [e.meta.output_name() for e in exprs]
+        if col_dept:
+            output_cols.append("department")
+        if col_econ:
+            output_cols.append("category")
         result = result.select([c for c in output_cols if c in result.columns])
 
-        # Add raw_data
+        # Add raw_data — build JSON column using polars struct serialisation
+        # instead of materialising the entire DataFrame as Python dicts.
+        # polars' .struct.json_encode() is vectorised and never creates
+        # Python objects for every row.
+        raw_struct = df.select(df.columns).to_struct("raw_struct")
         result = result.with_columns(
-            pl.Series("raw_data", raw_json, dtype=pl.String)
+            raw_struct.struct.json_encode().alias("raw_data")
         )
 
         return result
@@ -461,6 +480,7 @@ class ProcurementSource(BaseSource):
             return None
 
         exprs: list[pl.Expr] = []
+        dept_src: str | None = None
         for out_col, candidates in col_map.items():
             src = pick(candidates)
             if src:
@@ -473,19 +493,29 @@ class ProcurementSource(BaseSource):
                         pl.col(src).cast(pl.Float64, strict=False).alias(out_col)
                     )
                 elif out_col == "department":
-                    exprs.append(
-                        pl.col(src)
-                        .map_elements(normalize_department, return_dtype=pl.String)
-                        .alias(out_col)
-                    )
+                    # Batch lookup instead of map_elements
+                    dept_src = src
                 else:
                     exprs.append(pl.col(src).alias(out_col))
 
-        if not exprs:
+        if not exprs and dept_src is None:
             return df
 
-        result = df.with_columns(exprs)
+        if dept_src:
+            unique_depts = df.select(pl.col(dept_src).unique().drop_nulls()).to_series().to_list()
+            norm_col = "__dept_normalized"
+            dept_lookup = pl.DataFrame({
+                dept_src: unique_depts,
+                norm_col: [normalize_department(d) for d in unique_depts],
+            })
+            df = df.join(dept_lookup, on=dept_src, how="left").with_columns(
+                pl.col(norm_col).alias("department")
+            ).drop(norm_col)
+
+        result = df.with_columns(exprs) if exprs else df
         output_cols = [e.meta.output_name() for e in exprs]
+        if dept_src:
+            output_cols.append("department")
         return result.select([c for c in output_cols if c in result.columns])
 
     async def get_metadata(self) -> dict[str, Any]:
