@@ -44,7 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "pipeline",
-        choices=["economic-pulse", "housing", "procurement", "trade", "all"],
+        choices=["economic-pulse", "housing", "procurement", "trade", "trade-hs6", "all"],
         help="Pipeline to run",
     )
     parser.add_argument(
@@ -80,6 +80,25 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="YYYY-YYYY",
         help="Filter procurement contracts to a fiscal year (e.g. 2024-2025)",
+    )
+    parser.add_argument(
+        "--from-year",
+        type=int,
+        default=None,
+        help="Start year for trade-hs6 pipeline (default: 2019)",
+    )
+    parser.add_argument(
+        "--to-year",
+        type=int,
+        default=None,
+        help="End year for trade-hs6 pipeline (default: current year)",
+    )
+    parser.add_argument(
+        "--province",
+        type=str,
+        default=None,
+        metavar="NAME",
+        help="Province filter for trade-hs6 pipeline (default: all)",
     )
     parser.add_argument(
         "--tables",
@@ -160,6 +179,16 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             )
             log.info("done", records_loaded=result.records_loaded, status=result.status)
 
+        elif pipeline == "trade-hs6":
+            from candata_pipeline.pipelines.statcan_trade_hs6 import run
+            result = await run(
+                from_year=args.from_year or 2019,
+                to_year=args.to_year,
+                province=args.province,
+                dry_run=args.dry_run,
+            )
+            log.info("done", records_loaded=result.records_loaded, status=result.status)
+
         elif pipeline == "all":
             await run_all(args)
 
@@ -176,6 +205,7 @@ async def run_all(args: argparse.Namespace) -> None:
     log = structlog.get_logger("run_all")
 
     from candata_pipeline.pipelines import economic_pulse, housing, procurement, trade
+    from candata_pipeline.pipelines import statcan_trade_hs6
 
     pipelines = [
         ("economic-pulse", economic_pulse.run, {
@@ -195,6 +225,12 @@ async def run_all(args: argparse.Namespace) -> None:
         ("trade", trade.run, {
             "start_date": args.start_date,
             "end_date": args.end_date,
+            "dry_run": args.dry_run,
+        }),
+        ("trade-hs6", statcan_trade_hs6.run, {
+            "from_year": args.from_year or 2019,
+            "to_year": args.to_year,
+            "province": args.province,
             "dry_run": args.dry_run,
         }),
     ]
