@@ -5,3 +5,25 @@
 
 # Output directory for static build
 outDir: build
+
+# Sidebar navigation — pages are also auto-discovered from the /pages directory.
+# This block controls display order and group labels.
+pages:
+  - path: /
+    name: Home
+  - path: /economy
+    name: Economy
+  - path: /housing
+    name: Canadian Housing Market
+    group: Housing
+  - path: /housing/affordability
+    name: Affordability Trends
+    group: Housing
+  - path: /trade
+    name: Trade Flows Overview
+    group: Trade
+  - path: /trade/by-province
+    name: Trade by Province
+    group: Trade
+  - path: /about
+    name: About

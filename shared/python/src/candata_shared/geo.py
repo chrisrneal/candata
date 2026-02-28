@@ -19,6 +19,8 @@ from __future__ import annotations
 import re
 from difflib import get_close_matches
 
+import polars as pl
+
 from candata_shared.constants import (
     ABBREVIATION_TO_CODE,
     CMA_CODES_CANONICAL,
@@ -222,3 +224,61 @@ def fsa_to_province_code(fsa: str) -> str | None:
     if not fsa or len(fsa) < 1:
         return None
     return fsa_province_map.get(fsa[0].upper())
+
+
+def normalize_geo_column(
+    df: pl.DataFrame,
+    geo_col: str = "GEO",
+    *,
+    code_alias: str = "sgc_code",
+    level_alias: str = "geo_level",
+) -> pl.DataFrame:
+    """Add ``sgc_code`` and ``geo_level`` columns using a batch lookup.
+
+    Instead of calling :func:`normalize_statcan_geo` row-by-row via
+    ``map_elements`` (which converts every value to a Python object),
+    this function:
+
+    1. Extracts the unique GEO strings.
+    2. Resolves each unique value once through :func:`normalize_statcan_geo`.
+    3. Joins the results back to the original DataFrame.
+
+    For a 500 000-row DataFrame with 15 unique GEO values this calls the
+    Python function only 15 times instead of 500 000.
+
+    Args:
+        df:          Input DataFrame containing *geo_col*.
+        geo_col:     Name of the column holding raw StatCan GEO strings.
+        code_alias:  Output column name for the SGC code.
+        level_alias: Output column name for the geo level.
+
+    Returns:
+        DataFrame with two new columns (*code_alias*, *level_alias*).
+    """
+    uniques = df.select(pl.col(geo_col).unique().drop_nulls()).to_series().to_list()
+
+    codes: list[str | None] = []
+    levels: list[str | None] = []
+    for geo in uniques:
+        result = normalize_statcan_geo(geo)
+        if result:
+            levels.append(result[0])
+            codes.append(result[1])
+        else:
+            levels.append(None)
+            codes.append(None)
+
+    lookup = pl.DataFrame(
+        {
+            geo_col: uniques,
+            code_alias: codes,
+            level_alias: levels,
+        },
+        schema={
+            geo_col: pl.String,
+            code_alias: pl.String,
+            level_alias: pl.String,
+        },
+    )
+
+    return df.join(lookup, on=geo_col, how="left")

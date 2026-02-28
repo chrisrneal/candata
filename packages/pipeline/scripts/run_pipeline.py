@@ -12,11 +12,12 @@ Usage:
     python scripts/run_pipeline.py all --backfill --start-date 2015-01-01
 
 Available pipelines:
-    economic-pulse  — GDP, CPI, employment, interest rates
-    housing         — CMHC vacancy rates, rents, housing starts
-    procurement     — Federal contracts and tenders
-    trade           — Import/export by HS code and province
-    all             — Run all pipelines sequentially
+    economic-pulse       — GDP, CPI, employment, interest rates
+    housing              — CMHC vacancy rates, rents, housing starts
+    housing-enrichment   — NHPI, building permits, Teranet HPI
+    procurement          — Federal contracts and tenders
+    trade                — Import/export by HS code and province
+    all                  — Run all pipelines sequentially
 """
 
 from __future__ import annotations
@@ -44,7 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "pipeline",
-        choices=["economic-pulse", "housing", "procurement", "trade", "all"],
+        choices=["economic-pulse", "housing", "housing-enrichment", "procurement", "trade", "trade-hs6", "comtrade", "all"],
         help="Pipeline to run",
     )
     parser.add_argument(
@@ -75,11 +76,63 @@ def build_parser() -> argparse.ArgumentParser:
         help="Procurement datasets to run (default: both)",
     )
     parser.add_argument(
+        "--fiscal-year",
+        type=str,
+        default=None,
+        metavar="YYYY-YYYY",
+        help="Filter procurement contracts to a fiscal year (e.g. 2024-2025)",
+    )
+    parser.add_argument(
+        "--from-year",
+        type=int,
+        default=None,
+        help="Start year for trade-hs6 pipeline (default: 2019)",
+    )
+    parser.add_argument(
+        "--to-year",
+        type=int,
+        default=None,
+        help="End year for trade-hs6 pipeline (default: current year)",
+    )
+    parser.add_argument(
+        "--level",
+        choices=["hs2", "hs6"],
+        default="hs2",
+        help="Product code level for comtrade pipeline (default: hs2)",
+    )
+    parser.add_argument(
+        "--years",
+        type=str,
+        default=None,
+        metavar="YEARS",
+        help="Years for comtrade pipeline as range (2019-2023) or list (2019,2020)",
+    )
+    parser.add_argument(
+        "--partners",
+        type=str,
+        default=None,
+        metavar="CODES",
+        help="Comma-separated ISO partner codes for comtrade pipeline",
+    )
+    parser.add_argument(
+        "--province",
+        type=str,
+        default=None,
+        metavar="NAME",
+        help="Province filter for trade-hs6 pipeline (default: all)",
+    )
+    parser.add_argument(
         "--tables",
         type=parse_tables,
         default=None,
         metavar="TABLE[,TABLE...]",
         help="Comma-separated StatCan table aliases for economic-pulse (gdp,cpi,unemployment,retail)",
+    )
+    parser.add_argument(
+        "--source",
+        choices=["nhpi", "permits", "teranet", "all"],
+        default="all",
+        help="Housing-enrichment sub-source to run (default: all)",
     )
     parser.add_argument(
         "--cmas",
@@ -134,10 +187,21 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             total = sum(r.records_loaded for r in results.values())
             log.info("done", total_records_loaded=total, tables=list(results.keys()))
 
+        elif pipeline == "housing-enrichment":
+            from candata_pipeline.pipelines.housing_enrichment import run
+            results = await run(
+                source=args.source,
+                start_date=args.start_date,
+                dry_run=args.dry_run,
+            )
+            total = sum(r.records_loaded for r in results.values())
+            log.info("done", total_records_loaded=total, tables=list(results.keys()))
+
         elif pipeline == "procurement":
             from candata_pipeline.pipelines.procurement import run
             results = await run(
                 datasets=args.datasets,
+                fiscal_year=args.fiscal_year,
                 dry_run=args.dry_run,
             )
             total = sum(r.records_loaded for r in results.values())
@@ -148,6 +212,31 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             result = await run(
                 start_date=args.start_date,
                 end_date=args.end_date,
+                dry_run=args.dry_run,
+            )
+            log.info("done", records_loaded=result.records_loaded, status=result.status)
+
+        elif pipeline == "trade-hs6":
+            from candata_pipeline.pipelines.statcan_trade_hs6 import run
+            result = await run(
+                from_year=args.from_year or 2019,
+                to_year=args.to_year,
+                province=args.province,
+                dry_run=args.dry_run,
+            )
+            log.info("done", records_loaded=result.records_loaded, status=result.status)
+
+        elif pipeline == "comtrade":
+            from candata_pipeline.pipelines.un_comtrade import run, _parse_int_list
+            comtrade_years = _parse_int_list(args.years) if args.years else None
+            comtrade_partners = (
+                [int(p.strip()) for p in args.partners.split(",")]
+                if args.partners else None
+            )
+            result = await run(
+                level=args.level,
+                partners=comtrade_partners,
+                years=comtrade_years,
                 dry_run=args.dry_run,
             )
             log.info("done", records_loaded=result.records_loaded, status=result.status)
@@ -167,7 +256,12 @@ async def run_all(args: argparse.Namespace) -> None:
     import structlog
     log = structlog.get_logger("run_all")
 
-    from candata_pipeline.pipelines import economic_pulse, housing, procurement, trade
+    from candata_pipeline.pipelines import economic_pulse, housing, housing_enrichment, procurement, trade
+    from candata_pipeline.pipelines import statcan_trade_hs6
+    from candata_pipeline.pipelines import un_comtrade
+
+    succeeded: list[str] = []
+    failed: list[tuple[str, str]] = []  # (name, error)
 
     pipelines = [
         ("economic-pulse", economic_pulse.run, {
@@ -181,6 +275,11 @@ async def run_all(args: argparse.Namespace) -> None:
             "cmas": args.cmas,
             "dry_run": args.dry_run,
         }),
+        ("housing-enrichment", housing_enrichment.run, {
+            "source": "all",
+            "start_date": args.start_date,
+            "dry_run": args.dry_run,
+        }),
         ("procurement", procurement.run, {
             "dry_run": args.dry_run,
         }),
@@ -189,7 +288,31 @@ async def run_all(args: argparse.Namespace) -> None:
             "end_date": args.end_date,
             "dry_run": args.dry_run,
         }),
+        ("trade-hs6", statcan_trade_hs6.run, {
+            "from_year": args.from_year or 2019,
+            "to_year": args.to_year,
+            "province": args.province,
+            "dry_run": args.dry_run,
+        }),
+        ("comtrade", un_comtrade.run, {
+            "level": args.level,
+            "dry_run": args.dry_run,
+        }),
     ]
+
+    # Gate: verify Supabase connectivity before running any pipeline
+    if not args.dry_run:
+        from candata_pipeline.loaders.supabase_loader import SupabaseLoader
+        loader = SupabaseLoader()
+        if not loader.connection_ok:
+            log.error(
+                "supabase_unreachable",
+                hint="Supabase is not reachable — aborting all pipelines. "
+                     "Start Supabase with `supabase start` or check SUPABASE_URL.",
+            )
+            return
+
+    _CONNECTION_ERRORS = ("Connection refused", "Name or service not known", "Network is unreachable")
 
     for name, runner, kwargs in pipelines:
         log.info("starting_pipeline", pipeline=name)
@@ -200,9 +323,35 @@ async def run_all(args: argparse.Namespace) -> None:
                 log.info("pipeline_done", pipeline=name, records_loaded=total)
             else:
                 log.info("pipeline_done", pipeline=name, records_loaded=result.records_loaded)
+            succeeded.append(name)
         except Exception as exc:
-            log.error("pipeline_error", pipeline=name, error=str(exc))
-            # Continue with remaining pipelines
+            error_str = str(exc)
+            log.error("pipeline_error", pipeline=name, error=error_str)
+            failed.append((name, error_str))
+            if any(pat in error_str for pat in _CONNECTION_ERRORS):
+                log.error(
+                    "aborting_remaining_pipelines",
+                    reason="Connection-level error detected; remaining pipelines would also fail.",
+                )
+                break
+
+    # Summary
+    total = len(succeeded) + len(failed)
+    log.info(
+        "run_all_summary",
+        total=total,
+        succeeded=len(succeeded),
+        failed=len(failed),
+    )
+    print(f"\n{'='*60}")
+    print(f"Pipeline Run Summary: {len(succeeded)}/{total} succeeded")
+    print(f"{'='*60}")
+    for name in succeeded:
+        print(f"  \u2713 {name}")
+    for name, err in failed:
+        short_err = err.split('\n')[0][:80]
+        print(f"  \u2717 {name}: {short_err}")
+    print(f"{'='*60}\n")
 
 
 def main() -> None:

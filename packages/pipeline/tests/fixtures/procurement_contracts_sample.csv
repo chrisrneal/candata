@@ -1,0 +1,8 @@
+reference_number,procurement_id,vendor_name,vendor_postal_code,buyer_name,contract_date,economic_object_code,description_en,description_fr,contract_period_start,delivery_date,original_value,final_value,comments_en,comments_fr,additional_comments_en,additional_comments_fr,amendment_value,agreement_type_code
+C-2024-001,PID-001, ACME CONSULTING INC. ,K1A 0B1,Public Works and Government Services Canada,2024-06-15,0350,IT consulting services,Services de consultation en TI,2024-07-01,2025-03-31,150000.00,175000.00,Amendment to increase scope,Modification pour augmenter la portée,Additional work required,Travail supplémentaire requis,25000.00,Y
+C-2024-002,PID-002,  deloitte LLP  ,M5V 2T3,National Defence,2024-08-01,0491,Financial audit services,Services de vérification financière,2024-09-01,2025-06-30,500000.00,500000.00,,,,,,N
+C-2024-003,PID-003,ibm canada ltd,L6K 3S3,PSPC,2024-11-20,0799,Cloud infrastructure hosting,Hébergement d'infrastructure infonuagique,2025-01-01,2026-12-31,2000000.00,2350000.00,Multi-year contract,Contrat pluriannuel,,,,Y
+C-2023-004,PID-004,KPMG CONSULTING,H3B 5H5,Health Canada,2023-02-10,0301,Policy advisory,Conseil en politiques,2023-03-01,2023-09-30,75000.00,75000.00,,,,,,N
+C-2024-005,PID-005,,K1A 0H4,Transport Canada,2024-05-01,0621,Vehicle maintenance,,2024-05-15,2024-12-31,30000.00,30000.00,,,,,,N
+C-2024-006,PID-006,CGI Group Inc.,K2K 3K1,,2024-07-22,0891,Software development,Développement de logiciels,2024-08-01,2025-07-31,800000.00,800000.00,,,,,,Y
+C-2024-001,PID-001A, ACME CONSULTING INC. ,K1A 0B1,Public Works and Government Services Canada,2024-06-15,0350,IT consulting services (amended),Services de consultation en TI (modifié),2024-07-01,2025-06-30,150000.00,200000.00,Second amendment,Deuxième modification,,,,Y

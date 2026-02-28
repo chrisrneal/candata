@@ -28,9 +28,11 @@ Usage:
 
 from __future__ import annotations
 
-import io
+import shutil
+import tempfile
 import zipfile
 from datetime import date
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -39,8 +41,8 @@ import structlog
 
 from candata_shared.config import settings
 from candata_shared.db import get_duckdb_connection
-from candata_shared.geo import normalize_statcan_geo
-from candata_shared.time_utils import parse_statcan_date
+from candata_shared.geo import normalize_geo_column, normalize_statcan_geo
+from candata_shared.time_utils import parse_statcan_date, parse_statcan_date_expr
 from candata_pipeline.sources.base import BaseSource
 from candata_pipeline.utils.retry import with_retry
 
@@ -159,8 +161,10 @@ class StatCanSource(BaseSource):
                 """
             )
 
-            # Write or replace staging table
-            duck.register("_tmp_statcan", df.to_arrow())
+            # Write or replace staging table — register the polars DataFrame
+            # directly (DuckDB supports polars natively) to avoid creating an
+            # intermediate Arrow copy.
+            duck.register("_tmp_statcan", df)
             duck.execute(f"CREATE OR REPLACE TABLE {staging} AS SELECT * FROM _tmp_statcan")
             duck.unregister("_tmp_statcan")
 
@@ -193,57 +197,132 @@ class StatCanSource(BaseSource):
     # ------------------------------------------------------------------
 
     @with_retry(max_attempts=3, base_delay=2.0, retry_on=(httpx.HTTPError,))
-    async def _download_csv_zip(self, table_pid: str) -> bytes:
-        """Download and return the raw zip bytes for a StatCan table."""
+    async def _download_csv_zip(self, table_pid: str) -> Path:
+        """Download a StatCan table ZIP to a temp file and return its path.
+
+        Streams the response to disk instead of buffering the entire
+        ZIP in memory, which avoids holding hundreds of MB of raw bytes
+        alongside the parsed DataFrame.
+        """
         url = self._csv_zip_url(table_pid)
         self._log.info("downloading", url=url, table_pid=table_pid)
-        async with httpx.AsyncClient(timeout=self._timeout, follow_redirects=True) as client:
-            response = await client.get(url)
-            response.raise_for_status()
-            return response.content
+        tmp = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout, follow_redirects=True) as client:
+                async with client.stream("GET", url) as response:
+                    response.raise_for_status()
+                    async for chunk in response.aiter_bytes(chunk_size=256 * 1024):
+                        tmp.write(chunk)
+            tmp.close()
+            return Path(tmp.name)
+        except Exception:
+            tmp.close()
+            Path(tmp.name).unlink(missing_ok=True)
+            raise
 
-    def _parse_csv_zip(self, zip_bytes: bytes, table_pid: str) -> pl.DataFrame:
+    @staticmethod
+    def _parse_csv_zip(
+        zip_path: Path,
+        table_pid: str,
+        *,
+        columns: list[str] | None = None,
+    ) -> pl.DataFrame:
         """
-        Extract and parse the data CSV from a StatCan zip bundle.
+        Extract and parse the data CSV from a StatCan zip bundle on disk.
+
+        Streams the CSV entry from the zip to a temp file so the full
+        uncompressed content is never held in memory alongside the
+        parsed DataFrame.
+
+        Uses ``pl.scan_csv`` (lazy) so that column projection pushdown
+        keeps only *columns* (if given) before materialising, which
+        prevents OOM on very large tables like building permits.
 
         The zip contains:
           - {pid}_en.csv       — data (may be UTF-8 with BOM)
           - {pid}_MetaData_en.csv — metadata (skipped)
         """
-        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-            # Find the data file (not metadata)
-            data_files = [
-                n for n in zf.namelist()
-                if n.endswith(".csv") and "MetaData" not in n
-            ]
-            if not data_files:
-                raise ValueError(f"No data CSV found in StatCan zip for pid={table_pid}")
+        csv_tmp_path: Path | None = None
+        try:
+            with zipfile.ZipFile(zip_path) as zf:
+                # Find the data file (not metadata)
+                data_files = [
+                    n for n in zf.namelist()
+                    if n.endswith(".csv") and "MetaData" not in n
+                ]
+                if not data_files:
+                    raise ValueError(f"No data CSV found in StatCan zip for pid={table_pid}")
 
-            raw_bytes = zf.read(data_files[0])
+                # Stream CSV from zip entry to a temp file instead of
+                # loading the entire uncompressed content into memory.
+                csv_fd = tempfile.NamedTemporaryFile(suffix=".csv", delete=False)
+                csv_tmp_path = Path(csv_fd.name)
+                with zf.open(data_files[0]) as src:
+                    shutil.copyfileobj(src, csv_fd, length=256 * 1024)
+                csv_fd.close()
 
-        # Remove UTF-8 BOM if present
-        if raw_bytes.startswith(b"\xef\xbb\xbf"):
-            raw_bytes = raw_bytes[3:]
+            # --- Strip BOM from first line if present ---
+            with open(csv_tmp_path, "rb") as f:
+                head = f.read(3)
+            if head == b"\xef\xbb\xbf":
+                import mmap, os
+                size = os.path.getsize(csv_tmp_path)
+                with open(csv_tmp_path, "r+b") as f:
+                    mm = mmap.mmap(f.fileno(), 0)
+                    mm.move(0, 3, size - 3)
+                    mm.flush()
+                    mm.close()
+                    f.truncate(size - 3)
 
-        df = pl.read_csv(
-            io.BytesIO(raw_bytes),
-            infer_schema_length=0,   # read everything as String first
-            null_values=list(_SUPPRESSED),
-            truncate_ragged_lines=True,
-        )
-        return df
+            # Use scan_csv (lazy) so polars can push down column
+            # selection before reading the full file into RAM.
+            lf = pl.scan_csv(
+                csv_tmp_path,
+                infer_schema_length=0,
+                null_values=list(_SUPPRESSED),
+                truncate_ragged_lines=True,
+            )
+
+            # Strip BOM remnants from first column header
+            first_col = lf.collect_schema().names()[0]
+            if first_col.startswith("\ufeff"):
+                lf = lf.rename({first_col: first_col.lstrip("\ufeff")})
+
+            if columns:
+                # Only keep requested columns (case-insensitive match).
+                available = {c.upper(): c for c in lf.collect_schema().names()}
+                selected = [available[c.upper()] for c in columns if c.upper() in available]
+                if selected:
+                    lf = lf.select(selected)
+
+            df = lf.collect()
+            return df
+        finally:
+            zip_path.unlink(missing_ok=True)
+            if csv_tmp_path:
+                csv_tmp_path.unlink(missing_ok=True)
 
     # ------------------------------------------------------------------
     # BaseSource interface
     # ------------------------------------------------------------------
 
-    async def extract(self, *, table_pid: str, use_cache: bool = True, **kwargs: Any) -> pl.DataFrame:  # noqa: E501
+    async def extract(  # noqa: E501
+        self,
+        *,
+        table_pid: str,
+        use_cache: bool = True,
+        columns: list[str] | None = None,
+        **kwargs: Any,
+    ) -> pl.DataFrame:
         """
         Download a StatCan full-table CSV (or return cached version).
 
         Args:
             table_pid:  StatCan product ID, e.g. "1810000401".
             use_cache:  If True, use DuckDB cache if recent enough.
+            columns:    If provided, only materialise these columns
+                        (case-insensitive). Drastically cuts memory for
+                        large tables like building permits.
 
         Returns:
             Raw polars DataFrame with original StatCan column names.
@@ -251,10 +330,15 @@ class StatCanSource(BaseSource):
         if use_cache and self._is_cached(table_pid):
             cached = self._load_from_cache(table_pid)
             if cached is not None:
+                if columns:
+                    available = {c.upper(): c for c in cached.columns}
+                    selected = [available[c.upper()] for c in columns if c.upper() in available]
+                    if selected:
+                        cached = cached.select(selected)
                 return cached
 
-        zip_bytes = await self._download_csv_zip(table_pid)
-        df = self._parse_csv_zip(zip_bytes, table_pid)
+        zip_path = await self._download_csv_zip(table_pid)
+        df = self._parse_csv_zip(zip_path, table_pid, columns=columns)
         self._cache_to_duckdb(table_pid, df)
         return df
 
@@ -286,10 +370,9 @@ class StatCanSource(BaseSource):
         Returns:
             Normalized polars DataFrame.
         """
-        df = raw.clone()
-
-        # Standardize column names to lowercase
-        df = df.rename({col: col.strip().upper() for col in df.columns})
+        # Operate on the input directly — polars expressions return new
+        # DataFrames so there is no need for an expensive .clone().
+        df = raw.rename({col: col.strip().upper() for col in raw.columns})
 
         # Drop rows where REF_DATE is missing (footnote rows at end of file)
         if "REF_DATE" not in df.columns:
@@ -297,11 +380,10 @@ class StatCanSource(BaseSource):
 
         df = df.filter(pl.col("REF_DATE").is_not_null() & (pl.col("REF_DATE") != ""))
 
-        # Parse ref_date: "YYYY-MM" → date(YYYY, MM, 1)
+        # Parse ref_date vectorially (handles YYYY-MM and YYYY-MM-DD
+        # native in polars; rare formats fall back to Python).
         df = df.with_columns(
-            pl.col("REF_DATE")
-            .map_elements(parse_statcan_date, return_dtype=pl.Date)
-            .alias("ref_date")
+            parse_statcan_date_expr("REF_DATE").alias("ref_date")
         ).filter(pl.col("ref_date").is_not_null())
 
         # Filter by start_date
@@ -319,30 +401,12 @@ class StatCanSource(BaseSource):
         else:
             df = df.with_columns(pl.lit(None).cast(pl.Float64).alias("value"))
 
-        # Normalize GEO → sgc_code + geo_level
-        def geo_to_code(geo: str | None) -> str | None:
-            if not geo:
-                return None
-            result = normalize_statcan_geo(geo)
-            return result[1] if result else None
-
-        def geo_to_level(geo: str | None) -> str | None:
-            if not geo:
-                return None
-            result = normalize_statcan_geo(geo)
-            return result[0] if result else None
-
+        # Normalize GEO → sgc_code + geo_level using a batch lookup
+        # (resolves each unique GEO string once then joins back).
         geo_col = "GEO" if "GEO" in df.columns else None
         if geo_col:
-            df = df.with_columns(
-                pl.col(geo_col).alias("geo"),
-                pl.col(geo_col)
-                .map_elements(geo_to_code, return_dtype=pl.String)
-                .alias("sgc_code"),
-                pl.col(geo_col)
-                .map_elements(geo_to_level, return_dtype=pl.String)
-                .alias("geo_level"),
-            )
+            df = df.with_columns(pl.col(geo_col).alias("geo"))
+            df = normalize_geo_column(df, geo_col)
         else:
             df = df.with_columns(
                 pl.lit(None).cast(pl.String).alias("geo"),

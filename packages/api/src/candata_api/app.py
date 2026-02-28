@@ -11,6 +11,9 @@ from candata_shared.config import settings
 from candata_api.middleware.logging import LoggingMiddleware
 from candata_api.middleware.rate_limit import RateLimitMiddleware
 from candata_api.routers.health import router as health_router
+from candata_api.routers.housing_analytics import router as housing_analytics_router
+from candata_api.routers.meta import router as meta_router
+from candata_api.routers.trade_analytics import router as trade_analytics_router
 from candata_api.routers.v1 import v1_router
 
 logger = structlog.get_logger()
@@ -42,6 +45,11 @@ def create_app() -> FastAPI:
     # Routers
     app.include_router(health_router)
     app.include_router(v1_router)
+
+    # Analytics / comparison routers (top-level, no /v1 prefix)
+    app.include_router(housing_analytics_router)
+    app.include_router(trade_analytics_router)
+    app.include_router(meta_router)
 
     logger.info("app_created", cors_origins=settings.cors_origins_list)
     return app

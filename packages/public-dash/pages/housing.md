@@ -1,85 +1,184 @@
 ---
-title: Housing Market
+title: Canadian Housing Market
 ---
 
-# Housing Market Overview
+# Canadian Housing Market
 
-Vacancy rates, average rents, and housing starts across Canadian census metropolitan areas. Data from CMHC.
-
-```sql vacancy_overview
-select g.name as cma, vr.ref_date, vr.bedroom_type, vr.vacancy_rate
-from vacancy_rates vr
-join geographies g on g.id = vr.geography_id
-where vr.bedroom_type = 'total'
-order by vr.ref_date desc
-limit 100
-```
-
-<DataTable data={vacancy_overview} />
+Monthly housing starts, completions, and units under construction across
+Canadian census metropolitan areas. Data from CMHC.
 
 ---
 
-## Vacancy Rates by CMA
-
-```sql vacancy_by_cma
-select g.name as cma, avg(vr.vacancy_rate) as avg_vacancy_rate
-from vacancy_rates vr
-join geographies g on g.id = vr.geography_id
-where vr.bedroom_type = 'total'
-group by g.name
-order by avg_vacancy_rate desc
+```sql cma_options
+select distinct cma_name
+from cmhc_housing
+order by cma_name
 ```
 
-<BarChart
-  data={vacancy_by_cma}
-  x=cma
-  y=avg_vacancy_rate
-  title="Average Vacancy Rate by CMA"
+<Dropdown
+  data={cma_options}
+  name=selected_cma
+  value=cma_name
+  title="Select CMA"
+  defaultValue="Toronto"
 />
 
 ---
 
-## Average Rents
+## Monthly Housing Starts by Dwelling Type
 
-```sql rent_overview
-select g.name as cma, ar.ref_date, ar.bedroom_type, ar.average_rent
-from average_rents ar
-join geographies g on g.id = ar.geography_id
-where ar.bedroom_type = '2br'
-order by ar.ref_date desc
-limit 100
+```sql starts_by_type
+select
+  year,
+  month,
+  make_date(year, month, 1) as ref_date,
+  dwelling_type,
+  value as units
+from cmhc_housing
+where cma_name = '${inputs.selected_cma}'
+  and data_type = 'Starts'
+  and intended_market = 'Total'
+  and dwelling_type in ('Single', 'Semi', 'Row', 'Apartment')
+  and make_date(year, month, 1) >= current_date - interval '5 years'
+order by ref_date, dwelling_type
 ```
 
-<DataTable data={rent_overview} />
+<LineChart
+  data={starts_by_type}
+  x=ref_date
+  y=units
+  series=dwelling_type
+  title="Monthly Housing Starts — {inputs.selected_cma}"
+  xAxisTitle="Month"
+  yAxisTitle="Units"
+/>
 
 ---
 
-## Housing Starts
+## Annual Completions
 
-```sql starts_overview
-select g.name as cma, hs.ref_date, hs.dwelling_type, hs.units
-from housing_starts hs
-join geographies g on g.id = hs.geography_id
-where hs.dwelling_type = 'total'
-order by hs.ref_date desc
-limit 100
+```sql annual_completions
+select
+  year,
+  sum(value) as completions
+from cmhc_housing
+where cma_name = '${inputs.selected_cma}'
+  and data_type = 'Completions'
+  and dwelling_type = 'Total'
+  and intended_market = 'Total'
+group by year
+order by year
 ```
 
-<DataTable data={starts_overview} />
+<BarChart
+  data={annual_completions}
+  x=year
+  y=completions
+  title="Annual Completions — {inputs.selected_cma}"
+  xAxisTitle="Year"
+  yAxisTitle="Units Completed"
+/>
 
 ---
 
-Explore detailed data for a specific CMA:
+## All CMAs — Latest Month Summary
 
-```sql cma_list
-select distinct g.name as cma
-from vacancy_rates vr
-join geographies g on g.id = vr.geography_id
-order by g.name
+```sql cma_latest_month
+with latest as (
+  select
+    cma_name,
+    max(make_date(year, month, 1)) as latest_date
+  from cmhc_housing
+  where data_type = 'Starts'
+    and dwelling_type = 'Total'
+    and intended_market = 'Total'
+  group by cma_name
+),
+current_month as (
+  select
+    h.cma_name,
+    h.cma_geoid,
+    h.value as starts
+  from cmhc_housing h
+  join latest l
+    on h.cma_name = l.cma_name
+    and make_date(h.year, h.month, 1) = l.latest_date
+  where h.data_type = 'Starts'
+    and h.dwelling_type = 'Total'
+    and h.intended_market = 'Total'
+),
+completions_month as (
+  select
+    h.cma_name,
+    h.value as completions
+  from cmhc_housing h
+  join latest l
+    on h.cma_name = l.cma_name
+    and make_date(h.year, h.month, 1) = l.latest_date
+  where h.data_type = 'Completions'
+    and h.dwelling_type = 'Total'
+    and h.intended_market = 'Total'
+),
+uc_month as (
+  select
+    h.cma_name,
+    h.value as under_construction
+  from cmhc_housing h
+  join latest l
+    on h.cma_name = l.cma_name
+    and make_date(h.year, h.month, 1) = l.latest_date
+  where h.data_type = 'UnderConstruction'
+    and h.dwelling_type = 'Total'
+    and h.intended_market = 'Total'
+),
+prior_year_starts as (
+  select
+    h.cma_name,
+    sum(h.value) as starts_py
+  from cmhc_housing h
+  join latest l on h.cma_name = l.cma_name
+  where h.data_type = 'Starts'
+    and h.dwelling_type = 'Total'
+    and h.intended_market = 'Total'
+    and h.year = extract(year from l.latest_date)::int - 1
+  group by h.cma_name
+),
+current_year_starts as (
+  select
+    h.cma_name,
+    sum(h.value) as starts_cy
+  from cmhc_housing h
+  join latest l on h.cma_name = l.cma_name
+  where h.data_type = 'Starts'
+    and h.dwelling_type = 'Total'
+    and h.intended_market = 'Total'
+    and h.year = extract(year from l.latest_date)::int
+  group by h.cma_name
+)
+select
+  cm.cma_name,
+  cm.cma_geoid,
+  cm.starts,
+  co.completions,
+  uc.under_construction,
+  round(
+    (cys.starts_cy - pys.starts_py)::numeric / nullif(pys.starts_py, 0) * 100,
+    1
+  ) as yoy_change_pct
+from current_month cm
+left join completions_month co on co.cma_name = cm.cma_name
+left join uc_month uc on uc.cma_name = cm.cma_name
+left join prior_year_starts pys on pys.cma_name = cm.cma_name
+left join current_year_starts cys on cys.cma_name = cm.cma_name
+order by cm.starts desc nulls last
 ```
 
-{#each cma_list as row}
+<DataTable
+  data={cma_latest_month}
+  rows=20
+  search=true
+/>
 
-- [{row.cma}](/housing/{row.cma})
+---
 
-{/each}
+*Data sourced from CMHC. Updated monthly. Explore [Affordability Trends](/housing/affordability).*

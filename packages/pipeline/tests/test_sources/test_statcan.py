@@ -194,9 +194,19 @@ class TestStatCanTransform:
 # ---------------------------------------------------------------------------
 
 class TestParseCsvZip:
+    @staticmethod
+    def _write_tmp_zip(zip_bytes: bytes) -> Path:
+        """Write zip bytes to a temp file and return its Path."""
+        import tempfile
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+        tmp.write(zip_bytes)
+        tmp.close()
+        return Path(tmp.name)
+
     def test_parse_extracts_data_file(self, cpi_zip: bytes):
         source = StatCanSource()
-        df = source._parse_csv_zip(cpi_zip, "1810000401")
+        zip_path = self._write_tmp_zip(cpi_zip)
+        df = source._parse_csv_zip(zip_path, "1810000401")
         assert isinstance(df, pl.DataFrame)
         assert "REF_DATE" in df.columns
 
@@ -204,7 +214,8 @@ class TestParseCsvZip:
         source = StatCanSource()
         csv_content = b"\xef\xbb\xbfREF_DATE,GEO,VALUE\n2023-01,Canada,157.1\n"
         zip_bytes = make_zip(csv_content, "test_pid")
-        df = source._parse_csv_zip(zip_bytes, "test_pid")
+        zip_path = self._write_tmp_zip(zip_bytes)
+        df = source._parse_csv_zip(zip_path, "test_pid")
         assert "REF_DATE" in df.columns
         assert df["REF_DATE"][0] == "2023-01"
 
@@ -213,8 +224,9 @@ class TestParseCsvZip:
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w") as zf:
             zf.writestr("1234_MetaData_en.csv", "metadata only")
+        zip_path = self._write_tmp_zip(buf.getvalue())
         with pytest.raises(ValueError, match="No data CSV"):
-            source._parse_csv_zip(buf.getvalue(), "1234")
+            source._parse_csv_zip(zip_path, "1234")
 
 
 # ---------------------------------------------------------------------------

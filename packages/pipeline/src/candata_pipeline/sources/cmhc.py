@@ -2,37 +2,43 @@
 sources/cmhc.py — CMHC Housing Market Information Portal source adapter.
 
 CMHC publishes housing data through Statistics Canada as downloadable CSV
-tables and (historically) through the HMIP internal API.
+tables and through the CMHC Housing Market Data API.
 
-Primary:  StatCan CSV ZIP downloads (reliable, always available).
-Fallback: CMHC's internal HMIPService POST endpoint (reverse-engineered
-          by the mountainmath/cmhc R package; currently returning 404).
-
-StatCan tables:
+StatCan tables (vacancy rates, rents, starts by dwelling type):
   34-10-0127 — Vacancy rates, CMA level (total only)
   34-10-0133 — Average rents, CMA level (by bedroom type + structure type)
   34-10-0148 — Housing starts, CMA level (by dwelling type, monthly)
 
-We pull three datasets:
+CMHC API (starts, completions, under-construction by dwelling + market):
+  https://www.cmhc-schl.gc.ca/api/v2/housing-market-data
+  Covers all 35 CMAs, broken down by dwelling type and intended market.
+
+We pull four datasets:
   1. Vacancy Rates by CMA            -> vacancy_rates table
   2. Average Rents by bedroom type   -> average_rents table
   3. Housing Starts by dwelling type  -> housing_starts table
+  4. CMHC housing (all CMAs)         -> cmhc_housing table
 
 Output schemas:
   Vacancy rates:  sgc_code, ref_date, bedroom_type, vacancy_rate, universe
   Average rents:  sgc_code, ref_date, bedroom_type, average_rent
   Housing starts: sgc_code, ref_date, dwelling_type, units
+  CMHC housing:   cma_name, cma_geoid, year, month, dwelling_type,
+                   data_type, intended_market, value
 
 Usage:
     source = CMHCSource()
     df = await source.extract(dataset="vacancy_rates")
     df = await source.extract(dataset="housing_starts", cmhc_geo_ids=[2270])
+    df = await source.extract_cmhc_api()
+    df = await source.extract_cmhc_api(cma_names=["Toronto", "Vancouver"])
 """
 
 from __future__ import annotations
 
 import asyncio
 import io
+import logging
 import zipfile
 from datetime import date
 from typing import Any, Literal
@@ -141,6 +147,131 @@ CMA_NAME_TO_CMHC.update({
     "st. johns": 200,
     "st. john's": 200,
 })
+
+# ---------------------------------------------------------------------------
+# All 36 Canadian CMAs — name -> census geoUID (user-facing key)
+# ---------------------------------------------------------------------------
+CMA_GEOUIDS: dict[str, str] = {
+    "St. John's": "001",
+    "Halifax": "205",
+    "Moncton": "305",
+    "Saint John": "310",
+    "Saguenay": "408",
+    "Quebec City": "421",
+    "Sherbrooke": "433",
+    "Trois-Rivières": "442",
+    "Montréal": "462",
+    "Ottawa-Gatineau": "505",
+    "Kingston": "521",
+    "Peterborough": "529",
+    "Oshawa": "532",
+    "Toronto": "535",
+    "Hamilton": "537",
+    "St. Catharines-Niagara": "539",
+    "Kitchener-Cambridge-Waterloo": "541",
+    "Brantford": "543",
+    "Guelph": "550",
+    "London": "555",
+    "Windsor": "559",
+    "Barrie": "568",
+    "Greater Sudbury": "580",
+    "Thunder Bay": "595",
+    "Winnipeg": "602",
+    "Regina": "705",
+    "Saskatoon": "725",
+    "Lethbridge": "810",
+    "Calgary": "825",
+    "Edmonton": "835",
+    "Kamloops": "920",
+    "Kelowna": "915",
+    "Abbotsford-Mission": "932",
+    "Vancouver": "933",
+    "Victoria": "935",
+    "Nanaimo": "938",
+}
+
+# CMA name -> CMHC HMIP METCODE (internal geo ID used by the ExportTable API).
+# Derived from mountainmath/cmhc R package cmhc_cma_translation_data.
+CMA_METCODES: dict[str, str] = {
+    "St. John's": "1640",
+    "Halifax": "0580",
+    "Moncton": "1040",
+    "Saint John": "1600",
+    "Saguenay": "0180",
+    "Quebec City": "1400",
+    "Sherbrooke": "1800",
+    "Trois-Rivières": "2320",
+    "Montréal": "1060",
+    "Ottawa-Gatineau": "1265",
+    "Kingston": "0700",
+    "Peterborough": "1320",
+    "Oshawa": "1250",
+    "Toronto": "2270",
+    "Hamilton": "0610",
+    "St. Catharines-Niagara": "1160",
+    "Kitchener-Cambridge-Waterloo": "0850",
+    "Brantford": "0125",
+    "Guelph": "0460",
+    "London": "0950",
+    "Windsor": "2640",
+    "Barrie": "0120",
+    "Greater Sudbury": "2000",
+    "Thunder Bay": "2240",
+    "Winnipeg": "2680",
+    "Regina": "1490",
+    "Saskatoon": "1700",
+    "Lethbridge": "0870",
+    "Calgary": "0140",
+    "Edmonton": "0340",
+    "Kamloops": "0650",
+    "Kelowna": "0670",
+    "Abbotsford-Mission": "0110",
+    "Vancouver": "2410",
+    "Victoria": "2440",
+    "Nanaimo": "1100",
+}
+
+# CMA name (lowercased) -> canonical CMA name for --cma filtering
+CMA_NAME_TO_GEOUID: dict[str, str] = {
+    name.lower(): name for name in CMA_GEOUIDS
+}
+
+# ---------------------------------------------------------------------------
+# CMHC HMIP ExportTable API (reverse-engineered, same as mountainmath/cmhc R)
+# ---------------------------------------------------------------------------
+_CMHC_EXPORT_URL = "https://www03.cmhc-schl.gc.ca/hmip-pimh/en/TableMapChart/ExportTable"
+
+_CMHC_COOKIE = (
+    "ORDERDESKSID=jFINZMyDxkcEQBY3IJL4p2tWB0kFbPOXLJC7Fv4uVCdYBCNcqIUgi7N53swo1Qty; "
+    "DoNotShowIntro=true"
+)
+
+# HMIP table IDs for historical CMA-level data by dwelling type
+_HMIP_TABLE_IDS: dict[str, str] = {
+    "Starts": "1.2.1",
+    "Completions": "1.2.2",
+    "UnderConstruction": "1.2.3",
+}
+
+CMHC_DATA_TYPES: list[str] = ["Starts", "Completions", "UnderConstruction"]
+
+_CMHC_API_SLEEP = 0.15
+_CMHC_API_MAX_RETRIES = 3
+
+# File logger for CMHC API errors
+_cmhc_error_logger = logging.getLogger("cmhc_errors")
+
+
+def _setup_cmhc_error_log() -> None:
+    """Configure a file handler for cmhc_errors.log (idempotent)."""
+    if not _cmhc_error_logger.handlers:
+        handler = logging.FileHandler("cmhc_errors.log", mode="a")
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+        )
+        _cmhc_error_logger.addHandler(handler)
+        _cmhc_error_logger.setLevel(logging.ERROR)
+
 
 # ---------------------------------------------------------------------------
 # StatCan table IDs for CMHC data (primary source)
@@ -480,6 +611,244 @@ class CMHCSource(BaseSource):
         return result.select(output_cols).filter(
             pl.col("ref_date").is_not_null() & pl.col("units").is_not_null()
         )
+
+    # ------------------------------------------------------------------
+    # CMHC HMIP ExportTable — starts / completions / under-construction
+    # ------------------------------------------------------------------
+
+    async def _fetch_hmip_table(
+        self,
+        client: httpx.AsyncClient,
+        cma_name: str,
+        metcode: str,
+        data_type: str,
+    ) -> list[dict[str, Any]]:
+        """
+        Fetch one CMA × DataType CSV from the CMHC ExportTable endpoint.
+
+        Returns flat record dicts for the cmhc_housing schema, or [] on
+        failure (after retries).
+        """
+        table_id = _HMIP_TABLE_IDS[data_type]
+        payload = {
+            "TableId": table_id,
+            "GeographyId": metcode,
+            "GeographyTypeId": "3",
+            "exportType": "csv",
+        }
+        last_exc: Exception | None = None
+        for attempt in range(_CMHC_API_MAX_RETRIES):
+            try:
+                resp = await client.post(
+                    _CMHC_EXPORT_URL,
+                    data=payload,
+                    headers={"Cookie": _CMHC_COOKIE},
+                )
+                resp.raise_for_status()
+                csv_text = resp.content.decode("latin-1")
+                return self._parse_hmip_csv(cma_name, data_type, csv_text)
+            except Exception as exc:
+                last_exc = exc
+                if attempt < _CMHC_API_MAX_RETRIES - 1:
+                    wait = 2 ** attempt
+                    self._log.warning(
+                        "hmip_retry",
+                        cma=cma_name,
+                        data_type=data_type,
+                        attempt=attempt + 1,
+                        wait_s=wait,
+                        error=str(exc),
+                    )
+                    await asyncio.sleep(wait)
+
+        msg = f"FAILED {cma_name} ({metcode}) {data_type}: {last_exc}"
+        _cmhc_error_logger.error(msg)
+        self._log.error("hmip_failed", cma=cma_name, data_type=data_type, error=str(last_exc))
+        return []
+
+    @staticmethod
+    def _parse_hmip_csv(
+        cma_name: str,
+        data_type: str,
+        csv_text: str,
+    ) -> list[dict[str, Any]]:
+        """
+        Parse the CMHC ExportTable CSV into flat record dicts.
+
+        The CSV has a header like:
+            ,Single,Semi-Detached,Row,Apartment,All,
+        and data rows like:
+            Jan 2020,152,4,171,"1,985","2,312",
+        """
+        import re
+
+        geo_id = CMA_GEOUIDS.get(cma_name, "")
+        records: list[dict[str, Any]] = []
+        lines = csv_text.strip().split("\n")
+
+        # Find the header row (starts with a comma: ",Single,Semi-...")
+        header_idx: int | None = None
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith(",") and "Single" in stripped:
+                header_idx = i
+                break
+
+        if header_idx is None:
+            return records
+
+        # Parse column names from header
+        header_parts = lines[header_idx].strip().split(",")
+        # header_parts[0] is empty (date column), rest are dwelling types
+        col_names = [p.strip() for p in header_parts[1:] if p.strip()]
+
+        # Map CMHC column names to our dwelling types
+        dwelling_map = {
+            "Single": "Single",
+            "Semi-Detached": "Semi",
+            "Row": "Row",
+            "Apartment": "Apartment",
+            "All": "Total",
+        }
+
+        # Month abbreviation -> month number
+        month_map = {
+            "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+            "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
+        }
+
+        # Parse data rows (start after header)
+        for line in lines[header_idx + 1:]:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("Notes") or stripped.startswith("Source") or stripped.startswith('"'):
+                break
+            # Skip empty/separator rows
+            if stripped == "," or all(c in ", " for c in stripped):
+                break
+
+            # Split respecting quoted values like "1,985"
+            parts: list[str] = []
+            current = ""
+            in_quotes = False
+            for ch in stripped:
+                if ch == '"':
+                    in_quotes = not in_quotes
+                elif ch == "," and not in_quotes:
+                    parts.append(current)
+                    current = ""
+                else:
+                    current += ch
+            parts.append(current)
+
+            date_str = parts[0].strip()
+            if not date_str:
+                continue
+
+            # Parse "Jan 2020" -> year, month
+            match = re.match(r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{4})", date_str)
+            if not match:
+                continue
+
+            month_int = month_map[match.group(1)]
+            year_int = int(match.group(2))
+
+            # Filter to 2015+
+            if year_int < 2015:
+                continue
+
+            # Parse values for each dwelling type column
+            for col_idx, col_name in enumerate(col_names):
+                dwelling = dwelling_map.get(col_name)
+                if not dwelling:
+                    continue
+                val_idx = col_idx + 1  # offset by 1 (date column)
+                if val_idx >= len(parts):
+                    continue
+                val_str = parts[val_idx].strip().replace(",", "")
+                if not val_str or val_str == "**":
+                    continue
+                try:
+                    value_int = int(float(val_str))
+                except (ValueError, TypeError):
+                    continue
+
+                records.append({
+                    "cma_name": cma_name,
+                    "cma_geoid": geo_id,
+                    "year": year_int,
+                    "month": month_int,
+                    "dwelling_type": dwelling,
+                    "data_type": data_type,
+                    "intended_market": "Total",
+                    "value": value_int,
+                })
+
+        return records
+
+    async def extract_cmhc_api(
+        self,
+        *,
+        cma_names: list[str] | None = None,
+    ) -> tuple[pl.DataFrame, int]:
+        """
+        Fetch starts/completions/under-construction from the CMHC HMIP
+        ExportTable endpoint for all 36 CMAs (or a filtered subset).
+
+        Makes 3 requests per CMA (one per data type). Each returns a CSV
+        with columns for Single/Semi-Detached/Row/Apartment/All.
+
+        Args:
+            cma_names: Optional list of CMA names to filter (case-insensitive).
+
+        Returns:
+            (DataFrame with cmhc_housing schema, error_count).
+        """
+        _setup_cmhc_error_log()
+
+        if cma_names:
+            targets: dict[str, str] = {}
+            for name in cma_names:
+                canonical = CMA_NAME_TO_GEOUID.get(name.strip().lower())
+                if canonical:
+                    targets[canonical] = CMA_METCODES[canonical]
+                else:
+                    self._log.warning("cmhc_api_unknown_cma", cma=name)
+            if not targets:
+                return pl.DataFrame(), 0
+        else:
+            targets = CMA_METCODES
+
+        self._log.info("cmhc_api_start", n_cmas=len(targets))
+
+        all_records: list[dict[str, Any]] = []
+        errors = 0
+
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            for cma_name, metcode in targets.items():
+                self._log.info("cmhc_api_cma_start", cma=cma_name, metcode=metcode)
+                for data_type in CMHC_DATA_TYPES:
+                    rows = await self._fetch_hmip_table(
+                        client, cma_name, metcode, data_type
+                    )
+                    if rows:
+                        all_records.extend(rows)
+                    else:
+                        errors += 1
+                    await asyncio.sleep(_CMHC_API_SLEEP)
+
+                self._log.info("cmhc_api_cma_done", cma=cma_name)
+
+        if not all_records:
+            return pl.DataFrame(), errors
+
+        df = pl.from_dicts(all_records).with_columns([
+            pl.col("year").cast(pl.Int32),
+            pl.col("month").cast(pl.Int32),
+            pl.col("value").cast(pl.Int64),
+        ])
+
+        self._log.info("cmhc_api_complete", rows=len(df), errors=errors)
+        return df, errors
 
     # ------------------------------------------------------------------
     # BaseSource interface

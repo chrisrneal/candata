@@ -2,11 +2,11 @@
 sources/procurement.py — Federal proactive disclosure procurement source.
 
 Pulls awarded contracts and open tenders from:
-  1. open.canada.ca proactive disclosure CSV (contracts)
+  1. open.canada.ca proactive disclosure CSV (contracts) via CKAN API
   2. CanadaBuys API (active/recent tenders)
 
-Contract CSV dataset:
-  https://open.canada.ca/data/en/dataset/d8f85d91-7dec-4fd1-8055-483b77225d8b
+Contract CSV dataset (CKAN):
+  GET https://open.canada.ca/data/api/3/action/package_show?id=d8f85d91-7dec-4fd1-8f59-35571b88e4d1
 
 Contract CSV columns (actual proactive disclosure format):
   reference_number, procurement_id, vendor_name, vendor_postal_code,
@@ -19,21 +19,20 @@ CanadaBuys tender API:
 
 Usage:
     source = ProcurementSource()
-    contracts_df = await source.run(dataset="contracts", year=2023)
-    tenders_df   = await source.run(dataset="tenders", status="active")
+    contracts_df = await source.extract(dataset="contracts")
+    tenders_df   = await source.extract(dataset="tenders")
 """
 
 from __future__ import annotations
 
 import io
-from datetime import date
+import re
 from typing import Any, Literal
 
 import httpx
 import polars as pl
 import structlog
 
-from candata_shared.config import settings
 from candata_pipeline.sources.base import BaseSource
 from candata_pipeline.utils.retry import with_retry
 
@@ -41,13 +40,19 @@ log = structlog.get_logger(__name__)
 
 Dataset = Literal["contracts", "tenders"]
 
-# open.canada.ca resource IDs for proactive disclosure contracts
-# The actual IDs may change — use the CKAN API to discover current ones
-_CONTRACT_RESOURCE_IDS: dict[str, str] = {
-    # Sample resource IDs — each department publishes separately.
-    # This list covers a subset; the full pipeline would paginate all depts.
-    "all": "d8f85d91-7dec-4fd1-8055-483b77225d8b",  # master aggregated file
-}
+# CKAN dataset ID for proactive disclosure of contracts
+_CKAN_DATASET_ID = "d8f85d91-7dec-4fd1-8f59-35571b88e4d1"
+_CKAN_API_URL = "https://open.canada.ca/data/api/3/action/package_show"
+
+# Fallback direct download URL if CKAN API fails
+_PROACTIVE_CSV_URL = (
+    "https://open.canada.ca/data/en/datastore/dump/d8f85d91-7dec-4fd1-8055-483b77225d8b"
+    "?bom=True&format=csv"
+)
+
+_CANADABUYS_TENDERS_URL = (
+    "https://canadabuys.canada.ca/en/tender-opportunities/api/v1/notices"
+)
 
 # Department name normalization for common misspellings / abbreviations
 _DEPT_NORMALIZE: dict[str, str] = {
@@ -66,13 +71,70 @@ _DEPT_NORMALIZE: dict[str, str] = {
     "cra": "Canada Revenue Agency",
     "canada revenue agency": "Canada Revenue Agency",
     "ircc": "Immigration, Refugees and Citizenship Canada",
+    "employment and social development canada": "Employment and Social Development Canada",
+    "esdc": "Employment and Social Development Canada",
+    "global affairs canada": "Global Affairs Canada",
+    "gac": "Global Affairs Canada",
+    "department of foreign affairs and international trade": "Global Affairs Canada",
+    "dfait": "Global Affairs Canada",
+    "treasury board of canada secretariat": "Treasury Board of Canada Secretariat",
+    "tbs": "Treasury Board of Canada Secretariat",
+    "fisheries and oceans canada": "Fisheries and Oceans Canada",
+    "dfo": "Fisheries and Oceans Canada",
+    "environment and climate change canada": "Environment and Climate Change Canada",
+    "eccc": "Environment and Climate Change Canada",
+    "natural resources canada": "Natural Resources Canada",
+    "nrcan": "Natural Resources Canada",
+    "innovation, science and economic development canada": "Innovation, Science and Economic Development Canada",
+    "ised": "Innovation, Science and Economic Development Canada",
+    "public safety canada": "Public Safety Canada",
+    "psc": "Public Safety Canada",
+    "indigenous services canada": "Indigenous Services Canada",
+    "isc": "Indigenous Services Canada",
+    "crown-indigenous relations and northern affairs canada": "Crown-Indigenous Relations and Northern Affairs Canada",
+    "cirnac": "Crown-Indigenous Relations and Northern Affairs Canada",
+}
+
+# Economic object code → category mapping (top-level groupings)
+_ECON_OBJ_CATEGORY: dict[str, str] = {
+    "0": "Personnel",
+    "1": "Transportation and Communications",
+    "2": "Information",
+    "3": "Professional and Special Services",
+    "4": "Rentals",
+    "5": "Repair and Maintenance",
+    "6": "Utilities, Materials and Supplies",
+    "7": "Acquisition of Land, Buildings and Works",
+    "8": "Acquisition of Machinery and Equipment",
+    "9": "Transfer Payments",
+    "12": "Other Subsidies and Payments",
 }
 
 
+def normalize_vendor(name: str | None) -> str | None:
+    """Normalize vendor name: trim whitespace, title case."""
+    if not name or not name.strip():
+        return None
+    cleaned = re.sub(r"\s+", " ", name.strip())
+    return cleaned.title()
+
+
 def normalize_department(name: str | None) -> str | None:
+    """Normalize department name using known variants."""
     if not name:
         return None
-    return _DEPT_NORMALIZE.get(name.strip().lower(), name.strip())
+    stripped = name.strip()
+    return _DEPT_NORMALIZE.get(stripped.lower(), stripped)
+
+
+def categorize_economic_object(code: str | None) -> str | None:
+    """Map an economic object code to a category label."""
+    if not code or not code.strip():
+        return None
+    prefix = code.strip()[:1]
+    if prefix == "1" and len(code.strip()) >= 2 and code.strip()[:2] == "12":
+        return _ECON_OBJ_CATEGORY.get("12")
+    return _ECON_OBJ_CATEGORY.get(prefix)
 
 
 class ProcurementSource(BaseSource):
@@ -80,33 +142,55 @@ class ProcurementSource(BaseSource):
 
     name = "CanadaBuys"
 
-    _PROACTIVE_URL = (
-        "https://open.canada.ca/data/en/datastore/dump/d8f85d91-7dec-4fd1-8055-483b77225d8b"
-        "?bom=True&format=csv"
-    )
-    _CANADABUYS_TENDERS_URL = "https://canadabuys.canada.ca/en/tender-opportunities/api/v1/notices"
-
     def __init__(self, timeout: float = 120.0) -> None:
         super().__init__()
         self._timeout = timeout
 
     # ------------------------------------------------------------------
-    # HTTP
+    # HTTP — CKAN API
     # ------------------------------------------------------------------
 
     @with_retry(max_attempts=3, base_delay=2.0, retry_on=(httpx.HTTPError,))
-    async def _download_contracts_csv(self) -> bytes:
-        """Download the proactive disclosure contract CSV dump."""
-        self._log.info("contracts_download", url=self._PROACTIVE_URL)
+    async def _fetch_ckan_metadata(self) -> dict[str, Any]:
+        """Fetch dataset metadata from the CKAN API."""
+        self._log.info("ckan_fetch", dataset_id=_CKAN_DATASET_ID)
         async with httpx.AsyncClient(
             timeout=self._timeout, follow_redirects=True
         ) as client:
-            r = await client.get(self._PROACTIVE_URL)
+            r = await client.get(
+                _CKAN_API_URL, params={"id": _CKAN_DATASET_ID}
+            )
+            r.raise_for_status()
+            payload = r.json()
+            if not payload.get("success"):
+                raise httpx.HTTPError(f"CKAN API error: {payload}")
+            return payload["result"]
+
+    def _extract_csv_urls(self, ckan_result: dict[str, Any]) -> list[str]:
+        """Extract CSV resource URLs from CKAN package metadata."""
+        urls: list[str] = []
+        for resource in ckan_result.get("resources", []):
+            fmt = (resource.get("format") or "").upper()
+            url = resource.get("url", "")
+            if fmt == "CSV" and url:
+                urls.append(url)
+        return urls
+
+    @with_retry(max_attempts=3, base_delay=2.0, retry_on=(httpx.HTTPError,))
+    async def _download_csv(self, url: str) -> bytes:
+        """Download a single CSV file."""
+        self._log.info("csv_download", url=url[:120])
+        async with httpx.AsyncClient(
+            timeout=self._timeout, follow_redirects=True
+        ) as client:
+            r = await client.get(url)
             r.raise_for_status()
             return r.content
 
     @with_retry(max_attempts=3, base_delay=1.0, retry_on=(httpx.HTTPError,))
-    async def _fetch_tenders_page(self, page: int = 1, per_page: int = 100) -> dict[str, Any]:
+    async def _fetch_tenders_page(
+        self, page: int = 1, per_page: int = 100
+    ) -> dict[str, Any]:
         """Fetch a page of active tenders from the CanadaBuys API."""
         params = {
             "status": "active",
@@ -115,8 +199,19 @@ class ProcurementSource(BaseSource):
             "format": "json",
         }
         self._log.debug("tenders_fetch", page=page)
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            r = await client.get(self._CANADABUYS_TENDERS_URL, params=params)
+        async with httpx.AsyncClient(
+            timeout=self._timeout, follow_redirects=True
+        ) as client:
+            r = await client.get(_CANADABUYS_TENDERS_URL, params=params)
+            # Fail fast on 4xx — these are permanent client errors
+            # (e.g. 403 from the retired CanadaBuys API) and not
+            # worth retrying.  Wrap in RuntimeError so it bypasses
+            # the retry_on=(httpx.HTTPError,) filter.
+            if r.is_client_error:
+                raise RuntimeError(
+                    f"Client error '{r.status_code} {r.reason_phrase}' "
+                    f"for url '{r.url}'"
+                )
             r.raise_for_status()
             return r.json()
 
@@ -128,44 +223,83 @@ class ProcurementSource(BaseSource):
         self,
         *,
         dataset: Dataset = "contracts",
-        year: int | None = None,
-        status: str = "active",
         max_tenders: int = 500,
         **kwargs: Any,
     ) -> pl.DataFrame:
         """
         Download procurement data.
 
-        Args:
-            dataset:     "contracts" or "tenders".
-            year:        Filter contracts to this award year (None = all).
-            status:      Tender status filter ("active", "closed").
-            max_tenders: Maximum tender rows to fetch.
+        For contracts: queries CKAN API for CSV resource URLs, downloads and
+        concatenates all CSVs. Falls back to direct URL if CKAN fails.
 
-        Returns:
-            Raw polars DataFrame.
+        For tenders: paginates the CanadaBuys API.
         """
         if dataset == "contracts":
-            raw_bytes = await self._download_contracts_csv()
-            # Handle UTF-8 BOM
-            if raw_bytes.startswith(b"\xef\xbb\xbf"):
-                raw_bytes = raw_bytes[3:]
-            df = pl.read_csv(
-                io.BytesIO(raw_bytes),
-                infer_schema_length=0,
-                truncate_ragged_lines=True,
-                encoding="utf8-lossy",
-            )
-            return df
+            return await self._extract_contracts()
+        return await self._extract_tenders(max_tenders)
 
-        # Tenders — paginate the API
+    async def _extract_contracts(self) -> pl.DataFrame:
+        """Download contract CSVs via CKAN API discovery."""
+        try:
+            metadata = await self._fetch_ckan_metadata()
+            csv_urls = self._extract_csv_urls(metadata)
+        except Exception as exc:
+            self._log.warning(
+                "ckan_fallback",
+                error=str(exc),
+                msg="Falling back to direct CSV URL",
+            )
+            csv_urls = [_PROACTIVE_CSV_URL]
+
+        if not csv_urls:
+            csv_urls = [_PROACTIVE_CSV_URL]
+
+        dfs: list[pl.DataFrame] = []
+        for url in csv_urls:
+            try:
+                raw_bytes = await self._download_csv(url)
+                # Handle UTF-8 BOM
+                if raw_bytes.startswith(b"\xef\xbb\xbf"):
+                    raw_bytes = raw_bytes[3:]
+                df = pl.read_csv(
+                    io.BytesIO(raw_bytes),
+                    infer_schema_length=0,
+                    truncate_ragged_lines=True,
+                    encoding="utf8-lossy",
+                )
+                if not df.is_empty():
+                    dfs.append(df)
+                    self._log.info("csv_loaded", url=url[:80], rows=len(df))
+            except Exception as exc:
+                self._log.warning("csv_failed", url=url[:80], error=str(exc))
+
+        if not dfs:
+            return pl.DataFrame()
+        return pl.concat(dfs, how="diagonal_relaxed")
+
+    async def _extract_tenders(self, max_tenders: int) -> pl.DataFrame:
+        """Paginate the CanadaBuys tender API.
+
+        NOTE: The CanadaBuys REST API was retired when buyandsell.gc.ca
+        migrated to a Drupal 10 site at canadabuys.canada.ca.  The endpoint
+        now returns 403/404. This method is kept for forward-compatibility in
+        case a replacement API is published.  Until then it will log a
+        warning and return an empty DataFrame.
+        """
         all_notices: list[dict[str, Any]] = []
         page = 1
         while len(all_notices) < max_tenders:
             try:
                 payload = await self._fetch_tenders_page(page)
             except Exception as exc:
-                self._log.warning("tenders_page_failed", page=page, error=str(exc))
+                self._log.warning(
+                    "tenders_api_unavailable",
+                    page=page,
+                    error=str(exc),
+                    hint="The CanadaBuys REST API has been retired. "
+                    "Tenders extraction is skipped until a replacement "
+                    "API is available.",
+                )
                 break
             notices = payload.get("data", payload.get("notices", []))
             if not notices:
@@ -179,14 +313,16 @@ class ProcurementSource(BaseSource):
             return pl.DataFrame()
         return pl.from_dicts(all_notices)
 
-    def transform(self, raw: pl.DataFrame, *, dataset: Dataset = "contracts") -> pl.DataFrame:
+    def transform(
+        self, raw: pl.DataFrame, *, dataset: Dataset = "contracts"
+    ) -> pl.DataFrame:
         """
         Normalize procurement data to contracts or tenders schema.
 
         Output for contracts:
             contract_number, vendor_name, department, category,
-            description, contract_value, start_date, end_date,
-            award_date, amendment_number, source_url, raw_data
+            description, contract_value, original_value, amendment_value,
+            start_date, end_date, award_date, source_url, raw_data
 
         Output for tenders:
             tender_number, title, department, category, region,
@@ -203,7 +339,6 @@ class ProcurementSource(BaseSource):
 
     def _transform_contracts(self, df: pl.DataFrame) -> pl.DataFrame:
         """Map proactive disclosure CSV columns to contracts table schema."""
-        result = pl.DataFrame()
 
         def pick(candidates: list[str]) -> str | None:
             for c in candidates:
@@ -211,51 +346,114 @@ class ProcurementSource(BaseSource):
                     return c
             return None
 
+        col_ref = pick(["reference_number", "contract_number", "procurement_id"])
         col_vendor = pick(["vendor_name", "vendor", "supplier_name"])
         col_dept = pick(["buyer_name", "department", "organization", "owner_org"])
         col_desc = pick(["description_en", "description", "desc"])
-        col_value = pick(["final_value", "contract_value", "original_value", "value"])
+        col_value = pick(["final_value", "contract_value", "value"])
+        col_orig = pick(["original_value"])
+        col_amend_val = pick(["amendment_value"])
         col_date = pick(["contract_date", "award_date", "date"])
         col_start = pick(["contract_period_start", "start_date"])
         col_end = pick(["delivery_date", "end_date"])
-        col_ref = pick(["reference_number", "contract_number", "procurement_id"])
-        col_amend = pick(["amendment_value", "amendment_number"])
+        col_econ = pick(["economic_object_code"])
 
         exprs: list[pl.Expr] = []
+        col_mapping: dict[str, str] = {}
 
         if col_ref:
             exprs.append(pl.col(col_ref).alias("contract_number"))
+            col_mapping["contract_number"] = col_ref
+
+        # Vectorized vendor normalization: strip, collapse whitespace, title-case
         if col_vendor:
-            exprs.append(pl.col(col_vendor).alias("vendor_name"))
-        if col_dept:
             exprs.append(
-                pl.col(col_dept)
-                .map_elements(normalize_department, return_dtype=pl.String)
-                .alias("department")
+                pl.col(col_vendor)
+                .str.strip_chars()
+                .str.replace_all(r"\s+", " ")
+                .str.to_titlecase()
+                .alias("vendor_name")
             )
+            col_mapping["vendor_name"] = col_vendor
+
+        # Department normalization via batch lookup
+        if col_dept:
+            unique_depts = df.select(pl.col(col_dept).unique().drop_nulls()).to_series().to_list()
+            norm_col = "__dept_normalized"
+            dept_lookup = pl.DataFrame({
+                col_dept: unique_depts,
+                norm_col: [normalize_department(d) for d in unique_depts],
+            })
+            df = df.join(dept_lookup, on=col_dept, how="left").with_columns(
+                pl.col(norm_col).alias("department")
+            ).drop(norm_col)
+            # Don't add to exprs — already a column
+            col_mapping["department"] = col_dept
+
         if col_desc:
             exprs.append(pl.col(col_desc).alias("description"))
+            col_mapping["description"] = col_desc
         if col_value:
-            exprs.append(pl.col(col_value).cast(pl.Float64, strict=False).alias("contract_value"))
+            exprs.append(
+                pl.col(col_value).cast(pl.Float64, strict=False).alias("contract_value")
+            )
+            col_mapping["contract_value"] = col_value
+        if col_orig:
+            exprs.append(
+                pl.col(col_orig).cast(pl.Float64, strict=False).alias("original_value")
+            )
+        if col_amend_val:
+            exprs.append(
+                pl.col(col_amend_val)
+                .cast(pl.Float64, strict=False)
+                .alias("amendment_value")
+            )
         if col_date:
-            exprs.append(pl.col(col_date).str.to_date(strict=False).alias("award_date"))
+            exprs.append(
+                pl.col(col_date).str.to_date(strict=False).alias("award_date")
+            )
+            col_mapping["award_date"] = col_date
         if col_start:
-            exprs.append(pl.col(col_start).str.to_date(strict=False).alias("start_date"))
+            exprs.append(
+                pl.col(col_start).str.to_date(strict=False).alias("start_date")
+            )
         if col_end:
-            exprs.append(pl.col(col_end).str.to_date(strict=False).alias("end_date"))
-        if col_amend:
-            exprs.append(pl.col(col_amend).alias("amendment_number"))
+            exprs.append(
+                pl.col(col_end).str.to_date(strict=False).alias("end_date")
+            )
 
-        if not exprs:
+        # Economic object category via batch lookup
+        if col_econ:
+            unique_codes = df.select(pl.col(col_econ).unique().drop_nulls()).to_series().to_list()
+            econ_lookup = pl.DataFrame({
+                col_econ: unique_codes,
+                "category": [categorize_economic_object(c) for c in unique_codes],
+            })
+            df = df.join(econ_lookup, on=col_econ, how="left")
+
+        if not exprs and not col_dept and not col_econ:
             return df
 
-        return df.with_columns(exprs).select(
-            [
-                e.meta.output_name()
-                for e in exprs
-                if e.meta.output_name() in df.with_columns(exprs).columns
-            ]
+        result = df.with_columns(exprs) if exprs else df
+
+        # Select only the output columns
+        output_cols = [e.meta.output_name() for e in exprs]
+        if col_dept:
+            output_cols.append("department")
+        if col_econ:
+            output_cols.append("category")
+        result = result.select([c for c in output_cols if c in result.columns])
+
+        # Add raw_data — build JSON column using polars struct serialisation
+        # instead of materialising the entire DataFrame as Python dicts.
+        # polars' .struct.json_encode() is vectorised and never creates
+        # Python objects for every row.
+        raw_struct = df.select(df.columns).to_struct("raw_struct")
+        result = result.with_columns(
+            raw_struct.struct.json_encode().alias("raw_data")
         )
+
+        return result
 
     def _transform_tenders(self, df: pl.DataFrame) -> pl.DataFrame:
         """Map CanadaBuys API fields to tenders table schema."""
@@ -265,7 +463,11 @@ class ProcurementSource(BaseSource):
             "department": ["department", "buyer_name", "organization"],
             "closing_date": ["closing_date", "close_date", "closing"],
             "status": ["status", "notice_status"],
-            "estimated_value": ["estimated_value", "budget", "contract_value"],
+            "estimated_value": [
+                "estimated_value",
+                "budget",
+                "contract_value",
+            ],
             "category": ["category", "commodity", "gsin"],
             "region": ["region", "delivery_region"],
             "source_url": ["url", "source_url", "link"],
@@ -278,32 +480,48 @@ class ProcurementSource(BaseSource):
             return None
 
         exprs: list[pl.Expr] = []
+        dept_src: str | None = None
         for out_col, candidates in col_map.items():
             src = pick(candidates)
             if src:
                 if out_col == "closing_date":
-                    exprs.append(pl.col(src).str.to_date(strict=False).alias(out_col))
-                elif out_col == "estimated_value":
-                    exprs.append(pl.col(src).cast(pl.Float64, strict=False).alias(out_col))
-                elif out_col == "department":
                     exprs.append(
-                        pl.col(src)
-                        .map_elements(normalize_department, return_dtype=pl.String)
-                        .alias(out_col)
+                        pl.col(src).str.to_date(strict=False).alias(out_col)
                     )
+                elif out_col == "estimated_value":
+                    exprs.append(
+                        pl.col(src).cast(pl.Float64, strict=False).alias(out_col)
+                    )
+                elif out_col == "department":
+                    # Batch lookup instead of map_elements
+                    dept_src = src
                 else:
                     exprs.append(pl.col(src).alias(out_col))
 
-        if not exprs:
+        if not exprs and dept_src is None:
             return df
-        return df.with_columns(exprs).select(
-            [e.meta.output_name() for e in exprs if e.meta.output_name() in df.with_columns(exprs).columns]
-        )
+
+        if dept_src:
+            unique_depts = df.select(pl.col(dept_src).unique().drop_nulls()).to_series().to_list()
+            norm_col = "__dept_normalized"
+            dept_lookup = pl.DataFrame({
+                dept_src: unique_depts,
+                norm_col: [normalize_department(d) for d in unique_depts],
+            })
+            df = df.join(dept_lookup, on=dept_src, how="left").with_columns(
+                pl.col(norm_col).alias("department")
+            ).drop(norm_col)
+
+        result = df.with_columns(exprs) if exprs else df
+        output_cols = [e.meta.output_name() for e in exprs]
+        if dept_src:
+            output_cols.append("department")
+        return result.select([c for c in output_cols if c in result.columns])
 
     async def get_metadata(self) -> dict[str, Any]:
         return {
             "source_name": self.name,
-            "contracts_url": self._PROACTIVE_URL,
-            "tenders_url": self._CANADABUYS_TENDERS_URL,
+            "ckan_dataset_id": _CKAN_DATASET_ID,
+            "tenders_url": _CANADABUYS_TENDERS_URL,
             "description": "Federal proactive disclosure contracts and CanadaBuys tenders",
         }

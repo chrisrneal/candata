@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "evidence dev",
-    "build": "evidence build",
+    "build": "VITE_EVIDENCE_SPA=true evidence build",
     "preview": "evidence preview",
     "sources": "evidence sources"
   },
@@ -14,7 +14,8 @@
     "@evidence-dev/core-components": "4.2.0",
     "@evidence-dev/evidence": "35.0.0",
     "@evidence-dev/postgres": "^1.0.10",
-    "@supabase/supabase-js": "^2.44.0"
+    "@supabase/supabase-js": "^2.44.0",
+    "git-remote-origin-url": "^4.0.0"
   },
   "devDependencies": {
     "@sveltejs/kit": "2.5.4",
