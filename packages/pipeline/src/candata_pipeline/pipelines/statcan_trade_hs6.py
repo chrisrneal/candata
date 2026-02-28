@@ -5,6 +5,9 @@ Ingests StatCan Table 12-10-0119-01 (Canadian International Merchandise Trade
 by NAPCS), transforms to a clean trade_flows_hs6 schema, optionally joins an
 NAPCS→HS6 concordance table, and upserts to Supabase.
 
+Uses chunked CSV reading via the large_file utility module to avoid OOM
+errors on the 2GB+ bulk CSV.
+
 Usage (as module):
     from candata_pipeline.pipelines.statcan_trade_hs6 import run
     result = await run(from_year=2022, dry_run=True)
@@ -16,6 +19,7 @@ CLI (via run_pipeline.py):
 from __future__ import annotations
 
 import io
+import os
 import re
 import shutil
 import tempfile
@@ -29,6 +33,19 @@ import polars as pl
 import structlog
 
 from candata_pipeline.loaders.supabase_loader import LoadResult, SupabaseLoader
+from candata_pipeline.utils.checkpoint import (
+    clear_checkpoint,
+    load_checkpoint,
+    save_checkpoint,
+)
+from candata_pipeline.utils.large_file import (
+    check_available_memory,
+    estimate_csv_rows,
+    get_or_download,
+    monitor_memory,
+    stream_csv_chunks,
+    upsert_chunk,
+)
 from candata_pipeline.utils.logging import configure_logging, get_logger
 from candata_pipeline.utils.retry import with_retry
 
@@ -55,6 +72,14 @@ CONFLICT_COLUMNS = [
     "partner_country", "napcs_code",
 ]
 
+PIPELINE_NAME = "trade_hs6"
+
+# Cache settings
+CACHE_DIR = Path(__file__).resolve().parents[3] / "data" / "cache"
+CACHE_FILENAME = "12100119-eng.zip"
+CACHE_CSV_FILENAME = "12100119-eng.csv"
+CACHE_MAX_AGE_HOURS = 168  # weekly
+
 # StatCan suppressed / missing markers
 _SUPPRESSED: frozenset[str] = frozenset({"x", "..", "...", "F", "E", "r", "p", ""})
 
@@ -63,75 +88,57 @@ _SUPPRESSED: frozenset[str] = frozenset({"x", "..", "...", "F", "E", "r", "p", "
 #                 "Total of all merchandise" → None (no code)
 _CODE_RE = re.compile(r"\[([A-Z0-9][A-Z0-9.]*)\]\s*$", re.IGNORECASE)
 
+# Columns to read from the bulk CSV
+_USECOLS = [
+    "REF_DATE", "GEO", "Trade",
+    "Principal trading partners",
+    "North American Product Classification System (NAPCS)",
+    "VALUE", "STATUS",
+]
+
+_DTYPE = {"VALUE": "float32", "STATUS": "str"}
+
 
 # ---------------------------------------------------------------------------
-# Download helpers
+# Download / extract helpers
 # ---------------------------------------------------------------------------
 
-@with_retry(max_attempts=3, base_delay=2.0, retry_on=(httpx.HTTPError,))
-async def _download_zip(url: str, timeout: float = 300.0) -> Path:
-    """Download a URL to a temp file and return its path."""
-    log.info("downloading", url=url)
-    tmp = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
-    try:
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-            async with client.stream("GET", url) as resp:
-                resp.raise_for_status()
-                async for chunk in resp.aiter_bytes(chunk_size=256 * 1024):
-                    tmp.write(chunk)
-        tmp.close()
-        return Path(tmp.name)
-    except Exception:
-        tmp.close()
-        Path(tmp.name).unlink(missing_ok=True)
-        raise
 
+def _extract_csv_from_zip(zip_path: Path, dest_dir: Path) -> Path:
+    """Extract the data CSV (not MetaData) from a StatCan ZIP.
 
-def _parse_csv_from_zip(zip_path: Path) -> pl.DataFrame:
-    """Extract the data CSV (not MetaData) from a StatCan ZIP on disk.
-
-    Streams the CSV entry to a temp file so the full uncompressed
-    content is never held in memory alongside the parsed DataFrame.
+    Returns the path to the extracted CSV file.
     """
-    csv_tmp_path: Path | None = None
-    try:
-        with zipfile.ZipFile(zip_path) as zf:
-            data_files = [
-                n for n in zf.namelist()
-                if n.endswith(".csv") and "MetaData" not in n
-            ]
-            if not data_files:
-                raise ValueError("No data CSV found in ZIP")
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path) as zf:
+        data_files = [
+            n for n in zf.namelist()
+            if n.endswith(".csv") and "MetaData" not in n
+        ]
+        if not data_files:
+            raise ValueError("No data CSV found in ZIP")
 
-            csv_fd = tempfile.NamedTemporaryFile(suffix=".csv", delete=False)
-            csv_tmp_path = Path(csv_fd.name)
-            with zf.open(data_files[0]) as src:
-                shutil.copyfileobj(src, csv_fd, length=256 * 1024)
-            csv_fd.close()
+        csv_name = data_files[0]
+        dest_csv = dest_dir / CACHE_CSV_FILENAME
 
-        df = pl.read_csv(
-            csv_tmp_path,
-            infer_schema_length=0,       # Read everything as Utf8 first
-            null_values=list(_SUPPRESSED),
-            truncate_ragged_lines=True,
-        )
+        with zf.open(csv_name) as src, open(dest_csv, "wb") as dst:
+            shutil.copyfileobj(src, dst, length=256 * 1024)
 
-        first_col = df.columns[0]
-        if first_col.startswith("\ufeff"):
-            df = df.rename({first_col: first_col.lstrip("\ufeff")})
+    # Strip BOM if present
+    with open(dest_csv, "rb") as f:
+        head = f.read(3)
+    if head == b"\xef\xbb\xbf":
+        content = dest_csv.read_bytes()[3:]
+        dest_csv.write_bytes(content)
 
-        return df
-    finally:
-        zip_path.unlink(missing_ok=True)
-        if csv_tmp_path:
-            csv_tmp_path.unlink(missing_ok=True)
+    return dest_csv
 
 
-async def _try_download_concordance() -> pl.DataFrame | None:
+async def _try_download_concordance() -> dict[str, tuple[str, str]]:
     """Attempt to download the NAPCS→HS6 concordance table.
 
-    Returns a DataFrame with columns [napcs_code, hs6_code, hs6_description]
-    if successful, or None if the URL is unavailable / unparseable.
+    Returns a dict mapping napcs_code → (hs6_code, hs6_description),
+    or an empty dict if the URL is unavailable.
     """
     try:
         log.info("concordance_download_attempt", url=CONCORDANCE_URL)
@@ -142,24 +149,18 @@ async def _try_download_concordance() -> pl.DataFrame | None:
             resp.raise_for_status()
             content_type = resp.headers.get("content-type", "")
 
-            if "csv" in content_type or "text/plain" in content_type:
-                body = resp.content
-                if body.startswith(b"\xef\xbb\xbf"):
-                    body = body[3:]
-                df = pl.read_csv(io.BytesIO(body), infer_schema_length=0)
-            elif "html" in content_type:
-                # Page is HTML, not a direct CSV download — skip
+            if "html" in content_type:
                 log.warning("concordance_html_page", msg="URL returned HTML, not CSV")
-                return None
-            else:
-                body = resp.content
-                if body.startswith(b"\xef\xbb\xbf"):
-                    body = body[3:]
-                df = pl.read_csv(
-                    io.BytesIO(body),
-                    infer_schema_length=0,
-                    truncate_ragged_lines=True,
-                )
+                return {}
+
+            body = resp.content
+            if body.startswith(b"\xef\xbb\xbf"):
+                body = body[3:]
+            df = pl.read_csv(
+                io.BytesIO(body),
+                infer_schema_length=0,
+                truncate_ragged_lines=True,
+            )
 
         # Normalize column names
         rename_map: dict[str, str] = {}
@@ -174,133 +175,115 @@ async def _try_download_concordance() -> pl.DataFrame | None:
 
         if "napcs_code" not in rename_map.values() or "hs6_code" not in rename_map.values():
             log.warning("concordance_columns_unrecognised", columns=df.columns)
-            return None
+            return {}
 
         df = df.rename(rename_map)
         keep = [c for c in ["napcs_code", "hs6_code", "hs6_description"] if c in df.columns]
         df = df.select(keep).unique(subset=["napcs_code"])
-        log.info("concordance_loaded", rows=len(df))
-        return df
+
+        result = {}
+        for row in df.iter_rows(named=True):
+            result[row["napcs_code"]] = (
+                row.get("hs6_code", ""),
+                row.get("hs6_description", ""),
+            )
+        log.info("concordance_loaded", rows=len(result))
+        return result
 
     except Exception as exc:
         log.warning("concordance_download_failed", error=str(exc))
-        return None
+        return {}
 
 
 # ---------------------------------------------------------------------------
-# Extract / Transform
+# Per-chunk transform (polars)
 # ---------------------------------------------------------------------------
+
 
 def _extract_code(text: str | None) -> str | None:
-    """Extract the bracketed NAPCS code from a description string.
-
-    Examples:
-        "Energy products [C12]" → "C12"
-        "Total of all merchandise"  → None
-    """
-    if not text:
+    """Extract the bracketed NAPCS code from a description string."""
+    if not isinstance(text, str) or not text:
         return None
     m = _CODE_RE.search(text.strip())
     return m.group(1) if m else None
 
 
-def transform(
-    raw: pl.DataFrame,
+def _extract_description(text: str | None) -> str | None:
+    """Return the description part before the bracketed code."""
+    if not isinstance(text, str) or not text:
+        return None
+    return re.sub(r"\s*\[[A-Z0-9][A-Z0-9.]*\]\s*$", "", text.strip(), flags=re.IGNORECASE)
+
+
+def _transform_chunk(
+    chunk: pl.DataFrame,
+    concordance: dict[str, tuple[str, str]],
     *,
     from_year: int | None = None,
     to_year: int | None = None,
     province: str | None = None,
-    concordance: pl.DataFrame | None = None,
-) -> pl.DataFrame:
-    """Transform the raw 12-10-0119-01 CSV into trade_flows_hs6 schema.
+) -> list[dict[str, Any]]:
+    """Transform a single polars chunk into a list of upsert-ready dicts.
 
-    Args:
-        raw:         Raw polars DataFrame from the CSV.
-        from_year:   Keep only rows with ref_year >= from_year.
-        to_year:     Keep only rows with ref_year <= to_year.
-        province:    If set, keep only rows matching this province.
-        concordance: Optional NAPCS→HS6 concordance DataFrame.
-
-    Returns:
-        Cleaned DataFrame matching trade_flows_hs6 schema.
+    Filters suppressed rows, parses dates, extracts NAPCS codes, and
+    optionally joins the concordance mapping.
     """
-    df = raw.rename({c: c.strip() for c in raw.columns})
-    log.info("raw_columns", columns=df.columns)
+    df = chunk.clone()
 
-    # ---- Identify key columns by pattern matching ----
-    cols_upper = {c: c.upper() for c in df.columns}
-
-    def _find_col(*patterns: str) -> str | None:
-        for c, cu in cols_upper.items():
-            for p in patterns:
-                if p in cu:
-                    return c
-        return None
-
-    ref_date_col = _find_col("REF_DATE")
-    geo_col = _find_col("GEO")
-    trade_col = _find_col("TRADE")
-    partner_col = _find_col("PRINCIPAL TRADING", "TRADING PARTNER", "PARTNER")
-    napcs_col = _find_col("NAPCS", "NORTH AMERICAN PRODUCT", "COMMODITY", "PRODUCT")
-    value_col = _find_col("VALUE")
-    status_col = _find_col("STATUS")
-    scalar_col = _find_col("SCALAR_FACTOR")
-
-    if ref_date_col is None:
-        raise ValueError(f"Cannot find REF_DATE column. Available: {df.columns}")
-
-    # ---- Drop suppressed rows ----
-    if status_col:
+    # Filter rows where STATUS is suppressed or VALUE is null
+    if "STATUS" in df.columns:
         df = df.filter(
-            pl.col(status_col).is_null() | (pl.col(status_col) != "x")
+            ~pl.col("STATUS").is_in(list(_SUPPRESSED)) | pl.col("STATUS").is_null()
         )
+    df = df.filter(pl.col("VALUE").is_not_null())
 
-    # ---- Drop null VALUE rows ----
-    if value_col:
-        df = df.filter(pl.col(value_col).is_not_null())
+    if df.is_empty():
+        return []
 
-    # ---- Parse REF_DATE → ref_year, ref_month ----
-    df = df.filter(
-        pl.col(ref_date_col).is_not_null() & (pl.col(ref_date_col) != "")
-    )
-
-    # StatCan REF_DATE can be "YYYY-MM" or "YYYY"
+    # Parse REF_DATE into ref_year and ref_month
+    df = df.with_columns(pl.col("REF_DATE").cast(pl.Utf8).str.strip_chars())
+    df = df.filter(pl.col("REF_DATE").str.len_chars() >= 4)
     df = df.with_columns(
-        pl.col(ref_date_col).str.slice(0, 4).cast(pl.Int32).alias("ref_year"),
-        pl.when(pl.col(ref_date_col).str.len_chars() >= 7)
-        .then(pl.col(ref_date_col).str.slice(5, 2).cast(pl.Int32))
-        .otherwise(pl.lit(1))
-        .alias("ref_month"),
+        pl.col("REF_DATE").str.slice(0, 4).cast(pl.Int32).alias("ref_year"),
+        pl.col("REF_DATE").str.slice(5, 2).cast(pl.Int32, strict=False).fill_null(1).alias("ref_month"),
     )
 
+    # Year filtering
     if from_year:
         df = df.filter(pl.col("ref_year") >= from_year)
     if to_year:
         df = df.filter(pl.col("ref_year") <= to_year)
 
-    # ---- GEO → province ----
-    if geo_col:
+    if df.is_empty():
+        return []
+
+    # GEO → province
+    napcs_col = "North American Product Classification System (NAPCS)"
+    trade_col = "Trade"
+    partner_col = "Principal trading partners"
+
+    if "GEO" in df.columns:
         df = df.with_columns(
-            pl.when(pl.col(geo_col).str.to_lowercase().str.contains("canada"))
+            pl.when(pl.col("GEO").str.strip_chars().str.to_lowercase().str.contains("canada"))
             .then(pl.lit("Canada"))
-            .otherwise(pl.col(geo_col).str.strip_chars())
+            .otherwise(pl.col("GEO").str.strip_chars())
             .alias("province")
         )
     else:
         df = df.with_columns(pl.lit("Canada").alias("province"))
 
     if province:
-        df = df.filter(
-            pl.col("province").str.to_lowercase() == province.lower()
-        )
+        df = df.filter(pl.col("province").str.to_lowercase() == province.lower())
+        if df.is_empty():
+            return []
 
-    # ---- Trade column → trade_flow ----
-    if trade_col:
-        # Keep only Import/Export rows (skip "Trade balance", totals, etc.)
+    # Trade flow
+    if trade_col in df.columns:
+        trade_lower = pl.col(trade_col).str.to_lowercase()
         df = df.filter(
-            pl.col(trade_col).str.to_lowercase().str.contains("import")
-            | pl.col(trade_col).str.to_lowercase().str.contains("export")
-        ).with_columns(
+            trade_lower.str.contains("import") | trade_lower.str.contains("export")
+        )
+        df = df.with_columns(
             pl.when(pl.col(trade_col).str.to_lowercase().str.contains("import"))
             .then(pl.lit("Import"))
             .otherwise(pl.lit("Export"))
@@ -309,25 +292,18 @@ def transform(
     else:
         df = df.with_columns(pl.lit("Export").alias("trade_flow"))
 
-    # ---- Partner country ----
-    if partner_col:
-        df = df.with_columns(
-            pl.col(partner_col).str.strip_chars().alias("partner_country")
-        )
+    # Partner country
+    if partner_col in df.columns:
+        df = df.with_columns(pl.col(partner_col).str.strip_chars().alias("partner_country"))
     else:
         df = df.with_columns(pl.lit("All countries").alias("partner_country"))
 
-    # ---- NAPCS code + description ----
-    if napcs_col:
-        # Vectorized regex extract instead of map_elements
+    # NAPCS code + description using map_elements for regex extraction
+    if napcs_col in df.columns:
         df = df.with_columns(
-            pl.col(napcs_col)
-            .str.strip_chars()
-            .str.extract(r"\[([A-Z0-9][A-Z0-9.]*)\]\s*$", 1)
-            .alias("napcs_code"),
-            pl.col(napcs_col).str.strip_chars().alias("napcs_description"),
+            pl.col(napcs_col).map_elements(_extract_code, return_dtype=pl.Utf8).alias("napcs_code"),
+            pl.col(napcs_col).map_elements(_extract_description, return_dtype=pl.Utf8).alias("napcs_description"),
         )
-        # Drop total / aggregate rows that don't have a code
         df = df.filter(pl.col("napcs_code").is_not_null())
     else:
         df = df.with_columns(
@@ -335,47 +311,31 @@ def transform(
             pl.lit("Unknown").alias("napcs_description"),
         )
 
-    # ---- VALUE → value_cad_millions ----
-    if value_col:
-        # Determine scalar factor
-        scalar_mult = 1.0
-        if scalar_col:
-            # Try to read the first non-null scalar factor
-            sample = df.select(pl.col(scalar_col).drop_nulls().first()).item()
-            if sample:
-                sample_lc = str(sample).strip().lower()
-                if "thousand" in sample_lc:
-                    scalar_mult = 1e-3  # thousands → millions
-                elif "million" in sample_lc:
-                    scalar_mult = 1.0   # already millions
-                elif "billion" in sample_lc:
-                    scalar_mult = 1e3   # billions → millions
-                elif "unit" in sample_lc:
-                    scalar_mult = 1e-6  # units → millions
-                else:
-                    scalar_mult = 1e-6  # assume raw dollars → millions
-                log.info("scalar_factor", sample=sample, multiplier=scalar_mult)
+    if df.is_empty():
+        return []
 
+    # VALUE → value_cad_millions
+    df = df.with_columns(
+        (pl.col("VALUE").cast(pl.Float64) * 1e-6).alias("value_cad_millions")
+    )
+
+    # Concordance join
+    if concordance:
         df = df.with_columns(
-            (pl.col(value_col).cast(pl.Float64, strict=False) * scalar_mult)
-            .alias("value_cad_millions")
+            pl.col("napcs_code").map_elements(
+                lambda c: concordance.get(c, ("", ""))[0], return_dtype=pl.Utf8
+            ).alias("hs6_code"),
+            pl.col("napcs_code").map_elements(
+                lambda c: concordance.get(c, ("", ""))[1], return_dtype=pl.Utf8
+            ).alias("hs6_description"),
         )
     else:
         df = df.with_columns(
-            pl.lit(None).cast(pl.Float64).alias("value_cad_millions")
+            pl.lit(None).cast(pl.Utf8).alias("hs6_code"),
+            pl.lit(None).cast(pl.Utf8).alias("hs6_description"),
         )
 
-    # ---- Concordance join (NAPCS → HS6) ----
-    if concordance is not None and not concordance.is_empty():
-        log.info("concordance_join", concordance_rows=len(concordance))
-        df = df.join(concordance, on="napcs_code", how="left")
-    else:
-        df = df.with_columns(
-            pl.lit(None).cast(pl.String).alias("hs6_code"),
-            pl.lit(None).cast(pl.String).alias("hs6_description"),
-        )
-
-    # ---- Select final columns ----
+    # Select final columns
     keep = [
         "ref_year", "ref_month", "province", "trade_flow",
         "partner_country", "napcs_code", "napcs_description",
@@ -383,75 +343,48 @@ def transform(
     ]
     df = df.select([c for c in keep if c in df.columns])
 
-    # Deduplicate on the unique key — keep last occurrence
+    # Deduplicate within chunk
     df = df.unique(subset=CONFLICT_COLUMNS, keep="last")
 
-    log.info(
-        "transform_complete",
-        rows=len(df),
-        unique_napcs=df["napcs_code"].n_unique() if "napcs_code" in df.columns else 0,
-        year_range=(
-            f"{df['ref_year'].min()}-{df['ref_year'].max()}"
-            if not df.is_empty()
-            else "empty"
-        ),
-    )
-    return df
+    # Convert to dicts, stripping None values
+    records = []
+    for row in df.iter_rows(named=True):
+        clean = {k: v for k, v in row.items() if v is not None}
+        records.append(clean)
+
+    return records
 
 
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 
-def _print_summary(df: pl.DataFrame) -> None:
-    """Print a human-readable summary of the loaded data."""
-    if df.is_empty():
-        print("No records loaded.")
-        return
-
-    min_row = df.sort(["ref_year", "ref_month"]).head(1)
-    min_date = f"{min_row['ref_year'][0]:04d}-{min_row['ref_month'][0]:02d}"
-    max_row = df.sort(["ref_year", "ref_month"], descending=True).head(1)
-    max_date = f"{max_row['ref_year'][0]:04d}-{max_row['ref_month'][0]:02d}"
-
-    # Top 5 NAPCS by import value
-    imports = (
-        df.filter(pl.col("trade_flow") == "Import")
-        .group_by("napcs_code")
-        .agg(pl.col("value_cad_millions").sum().alias("total"))
-        .sort("total", descending=True)
-        .head(5)
-    )
-    top_imports = [
-        f"  {r['napcs_code']}: {r['total']:.2f}M"
-        for r in imports.iter_rows(named=True)
-    ]
-
-    # Top 5 NAPCS by export value
-    exports = (
-        df.filter(pl.col("trade_flow") == "Export")
-        .group_by("napcs_code")
-        .agg(pl.col("value_cad_millions").sum().alias("total"))
-        .sort("total", descending=True)
-        .head(5)
-    )
-    top_exports = [
-        f"  {r['napcs_code']}: {r['total']:.2f}M"
-        for r in exports.iter_rows(named=True)
-    ]
-
-    print(f"\nLoaded {len(df)} records. Date range: {min_date} to {max_date}.")
-    print("Top 5 NAPCS codes by total import value:")
-    print("\n".join(top_imports) if top_imports else "  (none)")
-    print("Top 5 NAPCS codes by total export value:")
-    print("\n".join(top_exports) if top_exports else "  (none)")
-    print()
+def _print_summary(
+    total_rows: int,
+    total_inserted: int,
+    total_skipped: int,
+    total_errors: int,
+    cache_path: Path,
+) -> None:
+    """Print a human-readable summary of the pipeline run."""
+    cache_size_mb = cache_path.stat().st_size / 1_048_576 if cache_path.exists() else 0
+    print(f"\n{'='*60}")
+    print(f"StatCan Trade HS6 Pipeline Summary")
+    print(f"{'='*60}")
+    print(f"  Rows processed:  {total_rows:,}")
+    print(f"  Rows inserted:   {total_inserted:,}")
+    print(f"  Rows skipped:    {total_skipped:,}")
+    print(f"  Errors:          {total_errors:,}")
+    print(f"  Cache file size: {cache_size_mb:.1f}MB")
+    print(f"{'='*60}\n")
 
 
 # ---------------------------------------------------------------------------
 # Pipeline runner
 # ---------------------------------------------------------------------------
 
+
+@monitor_memory
 async def run(
     *,
     from_year: int | None = 2019,
@@ -460,10 +393,11 @@ async def run(
     dry_run: bool = False,
 ) -> LoadResult:
     """
-    Run the StatCan trade HS6 pipeline.
+    Run the StatCan trade HS6 pipeline with chunked processing.
 
-    Downloads table 12-10-0119-01, transforms to trade_flows_hs6 schema,
-    optionally joins NAPCS→HS6 concordance, and upserts to Supabase.
+    Downloads table 12-10-0119-01, streams the CSV in chunks, transforms
+    each chunk, and upserts to Supabase.  Uses checkpointing so
+    interrupted runs can resume.
 
     Args:
         from_year: Earliest year to include (default 2019).
@@ -475,6 +409,7 @@ async def run(
         LoadResult with record counts.
     """
     configure_logging()
+    check_available_memory(required_gb=1.0)
 
     if to_year is None:
         to_year = datetime.now().year
@@ -487,71 +422,124 @@ async def run(
         dry_run=dry_run,
     )
 
-    # ---- 1. Download bulk CSV ----
-    zip_path = await _download_zip(BULK_CSV_URL)
-    raw = _parse_csv_from_zip(zip_path)
-    log.info("raw_data_loaded", rows=len(raw), columns=raw.columns)
+    # ---- 1. Download bulk CSV (cached weekly) ----
+    zip_path = get_or_download(
+        BULK_CSV_URL, CACHE_DIR, CACHE_FILENAME,
+        max_age_hours=CACHE_MAX_AGE_HOURS,
+    )
 
-    # ---- 2. Attempt concordance download ----
+    # Extract CSV from ZIP if not already done
+    csv_path = CACHE_DIR / CACHE_CSV_FILENAME
+    if not csv_path.exists() or csv_path.stat().st_mtime < zip_path.stat().st_mtime:
+        print("Extracting CSV from ZIP...")
+        csv_path = _extract_csv_from_zip(zip_path, CACHE_DIR)
+
+    # ---- 2. Estimate rows ----
+    estimated_rows = estimate_csv_rows(csv_path)
+
+    # ---- 3. Attempt concordance download ----
     concordance = await _try_download_concordance()
 
-    # ---- 3. Transform ----
-    df = transform(
-        raw,
-        from_year=from_year,
-        to_year=to_year,
-        province=province,
-        concordance=concordance,
-    )
+    # ---- 4. Load checkpoint ----
+    start_row = load_checkpoint(PIPELINE_NAME)
+    if start_row > 0:
+        print(f"Resuming from checkpoint: row {start_row:,}")
 
-    # Free raw data — it can be very large and is no longer needed
-    del raw, concordance
+    # ---- 5. Stream and process chunks ----
+    total_rows = 0
+    total_inserted = 0
+    total_skipped = 0
+    total_errors = 0
 
-    if df.is_empty():
-        log.warning("trade_hs6_empty")
-        return LoadResult(table=TABLE_NAME)
+    loader = None
+    run_id = None
 
-    # ---- 4. Dry-run or load ----
-    if dry_run:
-        print("\n=== DRY RUN — first 20 rows ===")
-        with pl.Config(tbl_cols=-1, tbl_rows=20, fmt_str_lengths=60):
-            print(df.head(20))
-        _print_summary(df)
-        return LoadResult(table=TABLE_NAME, records_loaded=len(df))
-
-    # ---- 5. Upsert to Supabase ----
-    loader = SupabaseLoader()
-    run_id = await loader.start_pipeline_run(
-        "trade_hs6",
-        "StatCan-Trade-HS6",
-        metadata={
-            "from_year": from_year,
-            "to_year": to_year,
-            "province": province,
-        },
-    )
+    if not dry_run:
+        from candata_shared.db import get_supabase_client
+        supabase_client = get_supabase_client(service_role=True)
+        loader = SupabaseLoader()
+        run_id = await loader.start_pipeline_run(
+            PIPELINE_NAME,
+            "StatCan-Trade-HS6",
+            metadata={
+                "from_year": from_year,
+                "to_year": to_year,
+                "province": province,
+                "estimated_rows": estimated_rows,
+            },
+        )
 
     try:
-        result = await loader.upsert(
-            TABLE_NAME, df, conflict_columns=CONFLICT_COLUMNS
-        )
-        await loader.finish_pipeline_run(
-            run_id,
-            result,
-            metadata={"rows": result.records_loaded},
-        )
+        for chunk in stream_csv_chunks(
+            csv_path,
+            chunksize=50_000,
+            usecols=_USECOLS,
+            dtype=_DTYPE,
+            start_row=start_row,
+        ):
+            records = _transform_chunk(
+                chunk,
+                concordance,
+                from_year=from_year,
+                to_year=to_year,
+                province=province,
+            )
+            total_rows += len(chunk)
+            skipped = len(chunk) - len(records)
+            total_skipped += skipped
+
+            if not records:
+                save_checkpoint(PIPELINE_NAME, total_rows)
+                continue
+
+            if dry_run:
+                # Show first chunk sample only
+                if total_inserted == 0:
+                    print("\n=== DRY RUN — first 20 records ===")
+                    for r in records[:20]:
+                        print(r)
+                total_inserted += len(records)
+            else:
+                inserted, errs = upsert_chunk(
+                    supabase_client, TABLE_NAME, records, CONFLICT_COLUMNS,
+                )
+                total_inserted += inserted
+                total_errors += errs
+
+            save_checkpoint(PIPELINE_NAME, total_rows)
+
+        # ---- 6. Success — clear checkpoint ----
+        clear_checkpoint(PIPELINE_NAME)
+
+        if run_id and loader:
+            result = LoadResult(
+                table=TABLE_NAME,
+                records_loaded=total_inserted,
+                records_failed=total_errors,
+            )
+            await loader.finish_pipeline_run(
+                run_id, result,
+                metadata={"rows": total_inserted, "estimated_rows": estimated_rows},
+            )
+
     except Exception as exc:
-        await loader.fail_pipeline_run(run_id, str(exc))
+        if run_id and loader:
+            await loader.fail_pipeline_run(run_id, str(exc))
         raise
 
-    _print_summary(df)
+    _print_summary(total_rows, total_inserted, total_skipped, total_errors, csv_path)
+
     log.info(
         "trade_hs6_pipeline_complete",
-        records_loaded=result.records_loaded,
-        records_failed=result.records_failed,
-        status=result.status,
+        records_loaded=total_inserted,
+        records_failed=total_errors,
+        total_rows=total_rows,
     )
-    return result
+    return LoadResult(
+        table=TABLE_NAME,
+        records_loaded=total_inserted,
+        records_failed=total_errors,
+    )
 
 
 # ---------------------------------------------------------------------------

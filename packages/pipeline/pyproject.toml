@@ -20,6 +20,9 @@ dependencies = [
     "tenacity>=8.3",
     "anyio>=4.4",
     "python-dateutil>=2.9",
+    "tqdm>=4.65.0",
+    "psutil>=5.9.0",
+    "filelock>=3.12.0",
 ]
 
 [project.optional-dependencies]

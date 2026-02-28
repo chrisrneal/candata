@@ -11,17 +11,17 @@ CREATE TABLE IF NOT EXISTS comtrade_flows (
   partner_name     TEXT         NOT NULL,
   hs2_code         TEXT         NOT NULL,
   hs2_description  TEXT,
-  hs6_code         TEXT,                      -- nullable, only for HS6 pulls
+  hs6_code         TEXT         NOT NULL DEFAULT '',  -- empty string when no HS6 pull
   hs6_description  TEXT,
   flow             TEXT         NOT NULL CHECK (flow IN ('Import', 'Export')),
   value_usd        DOUBLE PRECISION,
   created_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 
--- Unique constraint using a functional index (COALESCE not allowed in UNIQUE)
-CREATE UNIQUE INDEX IF NOT EXISTS comtrade_flows_uq
-  ON comtrade_flows (period_year, reporter_code, partner_code, hs2_code, flow,
-                     COALESCE(hs6_code, ''));
+-- Unique constraint for ON CONFLICT upserts via PostgREST
+ALTER TABLE comtrade_flows
+  ADD CONSTRAINT comtrade_flows_uq
+  UNIQUE (period_year, reporter_code, partner_code, hs2_code, flow, hs6_code);
 
 -- Common query patterns
 CREATE INDEX IF NOT EXISTS comtrade_year_idx     ON comtrade_flows (period_year);

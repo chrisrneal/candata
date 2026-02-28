@@ -241,8 +241,9 @@ class RateLimiter:
 # ---------------------------------------------------------------------------
 
 def _get_api_key() -> str:
-    """Read the Comtrade API key from env."""
-    key = os.environ.get("COMTRADE_API_KEY", "")
+    """Read the Comtrade API key from settings (loaded from .env)."""
+    from candata_shared.config import settings
+    key = settings.comtrade_api_key
     if not key:
         log.info(
             "comtrade_api_key_missing",
@@ -317,6 +318,15 @@ async def _fetch_comtrade(
                 log.warning(
                     "comtrade_403",
                     msg="Access forbidden. Check your API key subscription.",
+                )
+                return []
+
+            # Handle 400 Bad Request — client error, no point retrying
+            if resp.status_code == 400:
+                log.warning(
+                    "comtrade_400",
+                    msg="Bad request — skipping this query.",
+                    url=str(resp.url),
                 )
                 return []
 
@@ -563,7 +573,16 @@ async def run(
     api_key = _get_api_key()
     limiter = RateLimiter(per_second=1, per_hour=500)
 
-    period_str = ",".join(str(y) for y in years)
+    # The public/preview endpoint only allows 1 period (year) per request.
+    # With an API key the authenticated endpoint accepts comma-separated years.
+    if api_key:
+        period_batches = [",".join(str(y) for y in years)]
+    else:
+        period_batches = [str(y) for y in years]
+        log.info(
+            "comtrade_public_endpoint",
+            msg=f"No API key — splitting {len(years)} years into individual requests.",
+        )
 
     log.info(
         "comtrade_pipeline_start",
@@ -627,6 +646,8 @@ async def run(
             transformed_rows=len(df),
         )
 
+    skipped_requests = 0
+
     async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
         for partner_code in partners:
             partner_name = KEY_PARTNERS.get(partner_code, str(partner_code))
@@ -634,63 +655,99 @@ async def run(
             if level == "hs2":
                 # Two calls per partner: imports + exports at HS2 level
                 for flow_code, flow_label in [("M", "Import"), ("X", "Export")]:
-                    log.info(
-                        "comtrade_fetch",
-                        partner=partner_name,
-                        flow=flow_label,
-                        level="hs2",
-                    )
-                    data = await _fetch_comtrade(
-                        client, limiter,
-                        period=period_str,
-                        partner_code=partner_code,
-                        flow_code=flow_code,
-                        cmd_code="AG2",   # All HS2-digit chapters
-                        api_key=api_key,
-                    )
-                    buffer.extend(data)
-                    total_records_fetched += len(data)
-                    log.info(
-                        "comtrade_fetched",
-                        partner=partner_name,
-                        flow=flow_label,
-                        records=len(data),
-                    )
+                    for period_str in period_batches:
+                        log.info(
+                            "comtrade_fetch",
+                            partner=partner_name,
+                            flow=flow_label,
+                            level="hs2",
+                            period=period_str,
+                        )
+                        try:
+                            data = await _fetch_comtrade(
+                                client, limiter,
+                                period=period_str,
+                                partner_code=partner_code,
+                                flow_code=flow_code,
+                                cmd_code="AG2",   # All HS2-digit chapters
+                                api_key=api_key,
+                            )
+                        except Exception as exc:
+                            log.warning(
+                                "comtrade_request_failed",
+                                partner=partner_name,
+                                flow=flow_label,
+                                period=period_str,
+                                error=str(exc),
+                            )
+                            skipped_requests += 1
+                            continue
+                        buffer.extend(data)
+                        total_records_fetched += len(data)
+                        log.info(
+                            "comtrade_fetched",
+                            partner=partner_name,
+                            flow=flow_label,
+                            period=period_str,
+                            records=len(data),
+                        )
 
             elif level == "hs6":
                 # Loop over each HS2 chapter for HS6 detail
                 for chapter in HS2_CHAPTERS:
                     for flow_code, flow_label in [("M", "Import"), ("X", "Export")]:
-                        log.info(
-                            "comtrade_fetch",
-                            partner=partner_name,
-                            flow=flow_label,
-                            chapter=chapter,
-                            level="hs6",
-                        )
-                        data = await _fetch_comtrade(
-                            client, limiter,
-                            period=period_str,
-                            partner_code=partner_code,
-                            flow_code=flow_code,
-                            cmd_code=chapter,
-                            api_key=api_key,
-                        )
-                        buffer.extend(data)
-                        total_records_fetched += len(data)
+                        for period_str in period_batches:
+                            log.info(
+                                "comtrade_fetch",
+                                partner=partner_name,
+                                flow=flow_label,
+                                chapter=chapter,
+                                level="hs6",
+                                period=period_str,
+                            )
+                            try:
+                                data = await _fetch_comtrade(
+                                    client, limiter,
+                                    period=period_str,
+                                    partner_code=partner_code,
+                                    flow_code=flow_code,
+                                    cmd_code=chapter,
+                                    api_key=api_key,
+                                )
+                            except Exception as exc:
+                                log.warning(
+                                    "comtrade_request_failed",
+                                    partner=partner_name,
+                                    flow=flow_label,
+                                    chapter=chapter,
+                                    period=period_str,
+                                    error=str(exc),
+                                )
+                                skipped_requests += 1
+                                continue
+                            buffer.extend(data)
+                            total_records_fetched += len(data)
 
-                        # Flush when buffer exceeds threshold
-                        if len(buffer) >= FLUSH_THRESHOLD:
-                            await _flush_buffer(buffer)
-                            buffer.clear()
+                            # Flush when buffer exceeds threshold
+                            if len(buffer) >= FLUSH_THRESHOLD:
+                                await _flush_buffer(buffer)
+                                buffer.clear()
 
     # Flush remaining records
     await _flush_buffer(buffer)
     buffer.clear()
 
+    if skipped_requests:
+        log.warning(
+            "comtrade_requests_skipped",
+            skipped=skipped_requests,
+            msg=f"{skipped_requests} request(s) failed and were skipped.",
+        )
+
     log.info(
         "comtrade_fetch_complete",
         total_records=total_records_fetched,
+        skipped_requests=skipped_requests,
         api_calls=limiter.total_calls,
     )
 

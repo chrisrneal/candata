@@ -260,6 +260,9 @@ async def run_all(args: argparse.Namespace) -> None:
     from candata_pipeline.pipelines import statcan_trade_hs6
     from candata_pipeline.pipelines import un_comtrade
 
+    succeeded: list[str] = []
+    failed: list[tuple[str, str]] = []  # (name, error)
+
     pipelines = [
         ("economic-pulse", economic_pulse.run, {
             "start_date": args.start_date,
@@ -320,15 +323,35 @@ async def run_all(args: argparse.Namespace) -> None:
                 log.info("pipeline_done", pipeline=name, records_loaded=total)
             else:
                 log.info("pipeline_done", pipeline=name, records_loaded=result.records_loaded)
+            succeeded.append(name)
         except Exception as exc:
             error_str = str(exc)
             log.error("pipeline_error", pipeline=name, error=error_str)
+            failed.append((name, error_str))
             if any(pat in error_str for pat in _CONNECTION_ERRORS):
                 log.error(
                     "aborting_remaining_pipelines",
                     reason="Connection-level error detected; remaining pipelines would also fail.",
                 )
                 break
+
+    # Summary
+    total = len(succeeded) + len(failed)
+    log.info(
+        "run_all_summary",
+        total=total,
+        succeeded=len(succeeded),
+        failed=len(failed),
+    )
+    print(f"\n{'='*60}")
+    print(f"Pipeline Run Summary: {len(succeeded)}/{total} succeeded")
+    print(f"{'='*60}")
+    for name in succeeded:
+        print(f"  \u2713 {name}")
+    for name, err in failed:
+        short_err = err.split('\n')[0][:80]
+        print(f"  \u2717 {name}: {short_err}")
+    print(f"{'='*60}\n")
 
 
 def main() -> None:

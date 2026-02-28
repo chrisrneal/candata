@@ -66,6 +66,7 @@ class Settings(BaseSettings):
     buyandsell_base_url: str = Field(
         default="https://canadabuys.canada.ca/en/tender-opportunities/api/v1"
     )
+    comtrade_api_key: str = Field(default="")
 
     # -------------------------------------------------------------------------
     # API server

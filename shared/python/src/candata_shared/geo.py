@@ -268,10 +268,17 @@ def normalize_geo_column(
             levels.append(None)
             codes.append(None)
 
-    lookup = pl.DataFrame({
-        geo_col: uniques,
-        code_alias: codes,
-        level_alias: levels,
-    })
+    lookup = pl.DataFrame(
+        {
+            geo_col: uniques,
+            code_alias: codes,
+            level_alias: levels,
+        },
+        schema={
+            geo_col: pl.String,
+            code_alias: pl.String,
+            level_alias: pl.String,
+        },
+    )
 
     return df.join(lookup, on=geo_col, how="left")

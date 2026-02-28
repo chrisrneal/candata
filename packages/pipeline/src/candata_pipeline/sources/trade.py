@@ -254,14 +254,17 @@ class TradeSource(BaseSource):
                 .alias("hs_code"),
                 pl.col(napcs_col).alias("hs_description"),
             )
+            # Drop rows without HS code (aggregate/total rows)
+            df = df.filter(pl.col("hs_code").is_not_null())
         else:
+            # Table 12-10-0011 has no commodity/NAPCS column — it is a
+            # partner-level aggregate.  Use "TOTAL" as the HS placeholder
+            # so the rows are not discarded.
+            self._log.info("no_napcs_column", columns=df.columns)
             df = df.with_columns(
-                pl.lit(None).cast(pl.String).alias("hs_code"),
-                pl.lit(None).cast(pl.String).alias("hs_description"),
+                pl.lit("TOTAL").alias("hs_code"),
+                pl.lit("Total of all commodities").alias("hs_description"),
             )
-
-        # Drop rows without HS code (aggregate/total rows)
-        df = df.filter(pl.col("hs_code").is_not_null())
 
         # Normalize GEO → province SGC code using batch lookup
         if "GEO" in df.columns:
@@ -362,6 +365,8 @@ class TradeSource(BaseSource):
             df = df.with_columns(pl.lit("export").alias("direction"))
 
         # HS code from NAPCS/commodity column — vectorized regex
+        # Table 12-10-0126 uses trailing bracket codes like "Description [411]"
+        # or "Description [C153]".  Extract the alphanumeric code from brackets.
         napcs_col = next(
             (c for c in df.columns if "NAPCS" in c.upper() or "PRODUCT" in c.upper() or "COMMODITY" in c.upper()),
             None,
@@ -370,7 +375,7 @@ class TradeSource(BaseSource):
             df = df.with_columns(
                 pl.col(napcs_col)
                 .str.strip_chars()
-                .str.extract(r"^\[?(\d{2,10})\]?\s*[-\u2013]", 1)
+                .str.extract(r"\[([A-Za-z]?\d{1,10})\]\s*$", 1)
                 .alias("hs_code"),
                 pl.col(napcs_col).alias("hs_description"),
             )
