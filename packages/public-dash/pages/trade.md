@@ -1,105 +1,110 @@
 ---
-title: Trade Flows
+title: Canadian Trade Flows
 ---
 
-# Trade Flows
+# Canadian Trade Flows
 
-Canadian import and export data by partner country.
-
-```sql trade_summary
-select direction, partner_country,
-  sum(value_cad) as total_value
-from trade_flows
-where partner_country != 'ALL'
-  and partner_country != 'WLD'
-group by direction, partner_country
-order by total_value desc
-limit 50
-```
-
-<DataTable data={trade_summary} />
+Canadian import and export flows by HS2 product chapter. Data from UN Comtrade.
 
 ---
 
-## Top Export Destinations
-
-```sql exports_by_country
-select partner_country, sum(value_cad) as total_exports
-from trade_flows
-where direction = 'export'
-  and partner_country != 'ALL'
-  and partner_country != 'WLD'
-group by partner_country
-order by total_exports desc
-limit 20
+```sql year_options
+select distinct period_year as year
+from comtrade_flows
+order by period_year desc
 ```
 
-<BarChart
-  data={exports_by_country}
-  x=partner_country
-  y=total_exports
-  title="Top Export Destinations (CAD)"
+<Dropdown
+  data={year_options}
+  name=selected_year
+  value=year
+  title="Year"
+  defaultValue=2023
 />
 
----
-
-## Top Import Sources
-
-```sql imports_by_country
-select partner_country, sum(value_cad) as total_imports
-from trade_flows
-where direction = 'import'
-  and partner_country != 'ALL'
-  and partner_country != 'WLD'
-group by partner_country
-order by total_imports desc
-limit 20
-```
-
-<BarChart
-  data={imports_by_country}
-  x=partner_country
-  y=total_imports
-  title="Top Import Sources (CAD)"
-/>
+<ButtonGroup name=selected_flow>
+  <ButtonGroupItem valueLabel="Exports" value="Export" default />
+  <ButtonGroupItem valueLabel="Imports" value="Import" />
+</ButtonGroup>
 
 ---
 
-## Trade Balance by Country
+## Top 20 Product Chapters
 
-```sql trade_balance
+```sql top_hs2
 select
-  partner_country,
-  sum(case when direction = 'export' then value_cad else 0 end) as exports,
-  sum(case when direction = 'import' then value_cad else 0 end) as imports,
-  sum(case when direction = 'export' then value_cad else 0 end) -
-    sum(case when direction = 'import' then value_cad else 0 end) as balance
-from trade_flows
-where partner_country != 'ALL'
-  and partner_country != 'WLD'
-group by partner_country
-order by exports + imports desc
+  hs2_code,
+  coalesce(hs2_description, 'HS2 ' || hs2_code) as description,
+  sum(value_usd) as total_usd
+from comtrade_flows
+where flow = '${inputs.selected_flow}'
+  and period_year = ${inputs.selected_year}
+  and hs6_code = ''
+group by hs2_code, hs2_description
+order by total_usd desc
 limit 20
 ```
 
-<DataTable data={trade_balance} />
+<BarChart
+  data={top_hs2}
+  x=description
+  y=total_usd
+  swapXY=true
+  title="Top 20 HS2 Chapters — {inputs.selected_flow}s {inputs.selected_year}"
+  xAxisTitle="HS2 Chapter"
+  yAxisTitle="Value (USD)"
+/>
 
 ---
 
-## Monthly Trade Trends
+## Total Imports and Exports Over Time
 
-```sql monthly_trade
-select ref_date, direction, sum(value_cad) as total_value
-from trade_flows
-where partner_country = 'ALL' or partner_country = 'WLD'
-group by ref_date, direction
-order by ref_date
+```sql trade_totals_over_time
+select
+  period_year,
+  flow,
+  sum(value_usd) as total_usd
+from comtrade_flows
+where hs6_code = ''
+  and period_year between 2019 and 2023
+group by period_year, flow
+order by period_year, flow
 ```
 
 <LineChart
-  data={monthly_trade}
-  x=ref_date
-  y=total_value
-  series=direction
-  title="Monthly Trade Volume (CAD)"
+  data={trade_totals_over_time}
+  x=period_year
+  y=total_usd
+  series=flow
+  title="Canada Total Trade 2019–2023 (USD)"
+  xAxisTitle="Year"
+  yAxisTitle="Total Value (USD)"
 />
+
+---
+
+## Trade Summary Table
+
+```sql trade_summary_table
+select
+  hs2_code,
+  coalesce(hs2_description, 'HS2 ' || hs2_code) as description,
+  sum(value_usd) as total_usd
+from comtrade_flows
+where flow = '${inputs.selected_flow}'
+  and period_year = ${inputs.selected_year}
+  and hs6_code = ''
+group by hs2_code, hs2_description
+order by total_usd desc
+limit 50
+```
+
+<DataTable
+  data={trade_summary_table}
+  rows=15
+  search=true
+/>
+
+---
+
+*Trade data from UN Comtrade (Canada as reporter, all partners). Explore [Trade by Province](/trade/by-province).*
