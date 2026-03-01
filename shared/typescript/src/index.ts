@@ -25,6 +25,14 @@ export type {
   EntityType,
   EntityRelationship,
 } from './types/entities';
+export type {
+  SavedReport,
+  ReportDefinition,
+  ReportFilters,
+  QueryResult,
+  QueryResultColumn,
+  QueryResultMeta,
+} from './types/reports';
 
 // Constants
 export {

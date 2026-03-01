@@ -4,6 +4,7 @@ import { useState } from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import {
+  BarChart2,
   BarChart3,
   ChevronLeft,
   ChevronRight,
@@ -24,6 +25,7 @@ const navItems = [
   { href: '/dashboard/housing', label: 'Housing', icon: Building2 },
   { href: '/dashboard/procurement', label: 'Procurement', icon: FileText },
   { href: '/dashboard/trade', label: 'Trade', icon: Ship },
+  { href: '/dashboard/reports', label: 'Reports', icon: BarChart2 },
 ];
 
 export function Sidebar() {
