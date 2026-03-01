@@ -6,7 +6,7 @@
 
 Candata is a data intelligence platform that aggregates fragmented Canadian government data sources — CMHC, Statistics Canada, UN Comtrade, Teranet, and more — into unified, queryable datasets with a REST API and interactive dashboards. It does for Canadian public data what Bloomberg does for financial markets: consolidates dozens of siloed government portals into a single, normalized data layer.
 
-If you're a policy analyst tracking housing affordability, a real estate firm benchmarking CMA performance, a trade consultancy analyzing cross-border flows, or a journalist fact-checking economic claims — you're currently scraping PDFs, navigating broken SDMX endpoints, and writing one-off parsers. Candata eliminates that work entirely. Query any indicator across any geography and time range with a single API call, or explore it visually in the public dashboard.
+If you're a policy analyst tracking housing affordability, a real estate firm benchmarking CMA performance, a trade consultancy analyzing cross-border flows, or a journalist fact-checking economic claims — you're currently scraping PDFs, navigating broken SDMX endpoints, and writing one-off parsers. Candata eliminates that work entirely. Query any indicator across any geography and time range with a single API call, explore it visually in the public dashboard, or build custom reports with the built-in report builder.
 
 ## Data Products
 
@@ -29,6 +29,8 @@ If you're a policy analyst tracking housing affordability, a real estate firm be
 | Customer Dashboard | Next.js 14, Stripe billing |
 | Public Dashboard | Evidence.dev |
 | Shared Models | Pydantic (Python), TypeScript interfaces |
+| Charts & Viz | Recharts, Evidence.dev |
+| State & Caching | SWR, @tanstack/react-query |
 | Infrastructure | < $75/month |
 
 ## Quickstart
@@ -88,6 +90,7 @@ Interactive OpenAPI docs are served at [`/docs`](http://localhost:8000/docs) whe
 
 - `/housing/*` — CMA-level starts, completions, under construction, affordability trends
 - `/trade/*` — Product-level import/export flows, bilateral trade, province breakdown
+- `/reports/*` — Custom report builder: create, save, query, and manage report definitions
 - `/meta/*` — CMA list, data freshness status
 
 All endpoints return JSON with `Cache-Control: max-age=3600`.
@@ -105,13 +108,14 @@ candata/
 │   ├── python/          # candata-shared (Pydantic models, DB clients, geo helpers)
 │   └── typescript/      # @candata/shared (TS interfaces, constants)
 ├── supabase/
-│   └── migrations/      # 001–009 ordered SQL migrations
+│   └── migrations/      # 001–014 ordered SQL migrations
 ├── monitoring/          # Data freshness checks and alerting
 └── scripts/             # setup.sh, dev.sh, deploy.sh
 ```
 
 ## Roadmap
 
+- [x] Custom report builder with saved definitions & CSV export
 - [ ] Census 2021 demographic profiles by CMA
 - [ ] StatCan labour force survey integration
 - [ ] Bank of Canada interest rate and monetary policy data

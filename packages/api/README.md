@@ -131,6 +131,51 @@ curl http://localhost:8000/v1/geo/35
 curl "http://localhost:8000/v1/search?q=toronto+housing"
 ```
 
+### Reports (Custom Report Builder)
+```bash
+# Run an ad-hoc query (no save)
+curl -X POST http://localhost:8000/v1/reports/query \
+  -H "Authorization: Bearer <jwt>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "metric": "cpi_monthly",
+    "group_by": "province",
+    "filters": { "provinces": ["ON", "BC"], "date_from": "2022-01", "date_to": "2024-06" }
+  }'
+
+# List saved reports
+curl http://localhost:8000/v1/reports -H "Authorization: Bearer <jwt>"
+
+# Create a saved report
+curl -X POST http://localhost:8000/v1/reports \
+  -H "Authorization: Bearer <jwt>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "title": "Ontario CPI Trend",
+    "description": "Monthly CPI for Ontario",
+    "definition": {
+      "metric": "cpi_monthly",
+      "group_by": "province",
+      "filters": { "provinces": ["ON"], "date_from": "2023-01", "date_to": "2024-06" },
+      "viz": "line"
+    }
+  }'
+
+# Get a saved report
+curl http://localhost:8000/v1/reports/{id} -H "Authorization: Bearer <jwt>"
+
+# Update a saved report
+curl -X PUT http://localhost:8000/v1/reports/{id} \
+  -H "Authorization: Bearer <jwt>" \
+  -H "Content-Type: application/json" \
+  -d '{ "title": "Updated Title" }'
+
+# Delete a saved report (soft delete)
+curl -X DELETE http://localhost:8000/v1/reports/{id} -H "Authorization: Bearer <jwt>"
+```
+
+Rate limiting applies to `/v1/reports/query` — a `429` response indicates the user has exceeded their tier's quota.
+
 ## Authentication
 
 Three modes, set via `X-API-Key` header or `Authorization: Bearer <jwt>`:

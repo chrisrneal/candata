@@ -8,6 +8,7 @@ Candata is a Canadian public data intelligence platform. It aggregates housing, 
 
 - Query housing trends: starts, completions, under construction, affordability by CMA
 - Analyze trade flows: top products, bilateral trade, provincial breakdown
+- Build and manage custom reports: create report definitions, run queries, save for reuse
 - Monitor data freshness and detect stale sources
 - Trigger pipeline runs to refresh data
 - Combine endpoints to produce analytical briefings
@@ -179,6 +180,76 @@ curl http://localhost:8000/meta/data-freshness
 ```
 
 **How to interpret:** If any table has `is_stale: true`, do not rely on that data source for current analysis without first refreshing it. If the endpoint returns HTTP 503, the freshness report has not been generated — run `freshness_check.py` first (see Section 3).
+
+### 2.6 Build and manage custom reports
+
+**Goal:** Create a saved report that tracks a metric over time, filtered by geography and date range.
+
+#### Query a report (ad-hoc, no save)
+
+```bash
+curl -X POST http://localhost:8000/v1/reports/query \
+  -H "Authorization: Bearer <jwt>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "metric": "cpi_monthly",
+    "group_by": "province",
+    "filters": {
+      "provinces": ["ON", "BC", "QC"],
+      "date_from": "2022-01",
+      "date_to": "2024-06"
+    }
+  }'
+```
+
+**Response:** Returns `{ columns, rows, meta }` where `meta` includes `total_rows`, `query_ms`, and `truncated`.
+
+#### Save a report definition
+
+```bash
+curl -X POST http://localhost:8000/v1/reports \
+  -H "Authorization: Bearer <jwt>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "title": "Ontario CPI vs Alberta CPI",
+    "description": "Monthly comparison of consumer price index",
+    "definition": {
+      "metric": "cpi_monthly",
+      "group_by": "province",
+      "filters": { "provinces": ["ON", "AB"], "date_from": "2022-01", "date_to": "2024-06" },
+      "viz": "line"
+    }
+  }'
+```
+
+#### List saved reports
+
+```bash
+curl http://localhost:8000/v1/reports \
+  -H "Authorization: Bearer <jwt>"
+```
+
+Returns an array of `SavedReport` objects (id, title, description, definition, last_run_at, created_at, updated_at).
+
+#### Get / update / delete a report
+
+```bash
+# Get
+curl http://localhost:8000/v1/reports/{id} -H "Authorization: Bearer <jwt>"
+
+# Update
+curl -X PUT http://localhost:8000/v1/reports/{id} \
+  -H "Authorization: Bearer <jwt>" \
+  -H "Content-Type: application/json" \
+  -d '{ "title": "Updated Title", "definition": { ... } }'
+
+# Delete (soft delete)
+curl -X DELETE http://localhost:8000/v1/reports/{id} -H "Authorization: Bearer <jwt>"
+```
+
+**Rate limiting:** The `/v1/reports/query` endpoint is subject to the same API-key tier rate limits. A 429 response means the user has exceeded their quota — wait or upgrade.
+
+**Schema:** Report definitions are stored in the `saved_reports` table (migration 014). Row-level security ensures users can only access their own reports.
 
 ---
 
@@ -585,3 +656,47 @@ curl http://localhost:8000/meta/cmas
 ```
 
 Verify each returns HTTP 200 with non-empty data. The platform is ready for the demo.
+
+---
+
+### Workflow 4: Automated monthly report refresh
+
+**Objective:** Refresh all saved reports after a data pipeline update and flag any that returned zero rows.
+
+**Step 1: Check all freshness data is current (see Workflow 3).**
+
+**Step 2: List the user's saved reports.**
+
+```bash
+curl http://localhost:8000/v1/reports \
+  -H "Authorization: Bearer <jwt>"
+```
+
+**Step 3: For each report, re-run the query.**
+
+```bash
+curl -X POST http://localhost:8000/v1/reports/query \
+  -H "Authorization: Bearer <jwt>" \
+  -H "Content-Type: application/json" \
+  -d '<report.definition>'
+```
+
+**Step 4: Check for zero-row results.**
+
+If `meta.total_rows == 0`, flag the report. Possible reasons:
+- Date range is now outside the available data window (shift `date_from` / `date_to`).
+- Geography filter references a code that no longer exists.
+- The underlying table is empty for this metric.
+
+**Step 5: Update `last_run_at` by saving the report.**
+
+```bash
+curl -X PUT http://localhost:8000/v1/reports/{id} \
+  -H "Authorization: Bearer <jwt>" \
+  -H "Content-Type: application/json" \
+  -d '{ "title": "<existing title>" }'
+```
+
+**Step 6: Report summary.**
+
+Produce a table of all reports with columns: title, metric, rows returned, query time, status (OK / EMPTY / ERROR).

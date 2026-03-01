@@ -50,6 +50,14 @@ Annual bilateral trade data between Canada and its top 10 trading partners at th
 
 **Use case:** A journalist investigating Canada-China trade dependency pulls the top 20 import categories from China for the past five years and shows that critical minerals imports have tripled, providing data-backed evidence for a story on supply chain vulnerability.
 
+### Custom Report Builder
+
+Build, save, and re-run custom data reports across all domains — housing, trade, indicators, and procurement. Pick a metric, filter by geography and date range, and visualise results as line, bar, or area charts with a sortable data table. Reports are saved to your account for one-click refresh, and results can be exported to CSV.
+
+The report builder supports 18 pre-configured metrics spanning four domains: 8 economic indicators (CPI, GDP, unemployment, employment, population, immigration, retail sales, interest rate), 4 housing metrics (NHPI, building permits, housing starts, Teranet HPI), 3 procurement metrics (contract spending, tender count, vendor awards), and 3 trade metrics (exports, imports, trade balance). Group results by province or CMA and apply date range filters with one-click presets for 1-year, 3-year, and 5-year windows.
+
+**Use case:** A provincial economic development officer builds a saved report tracking monthly housing starts and building permits for their top 5 target CMAs over the past three years, bookmarks it, and re-runs it each month to spot supply trends before they show up in analyst reports.
+
 ## Get Access
 
 ### Free
