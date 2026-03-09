@@ -3,10 +3,10 @@ sources/procurement.py — Federal proactive disclosure procurement source.
 
 Pulls awarded contracts and open tenders from:
   1. open.canada.ca proactive disclosure CSV (contracts) via CKAN API
-  2. CanadaBuys API (active/recent tenders)
+  2. CanadaBuys open-data CSV feeds (tenders)
 
 Contract CSV dataset (CKAN):
-  GET https://open.canada.ca/data/api/3/action/package_show?id=d8f85d91-7dec-4fd1-8f59-35571b88e4d1
+  GET https://open.canada.ca/data/api/3/action/package_show?id=d8f85d91-7dec-4fd1-8055-483b77225d8b
 
 Contract CSV columns (actual proactive disclosure format):
   reference_number, procurement_id, vendor_name, vendor_postal_code,
@@ -14,8 +14,15 @@ Contract CSV columns (actual proactive disclosure format):
   contract_period_start, delivery_date, original_value, final_value,
   comments_en, additional_comments_en, amendment_value, agreement_type_code
 
-CanadaBuys tender API:
+CanadaBuys tender CSV feeds (replaced the retired REST API in 2023):
+  - Open tenders:    https://canadabuys.canada.ca/opendata/pub/openTenderNotice-ouvertAvisAppelOffres.csv
+  - Complete archive: https://canadabuys.canada.ca/opendata/pub/tenderNoticeComplete-avisAppelOffresComplet.csv
+  Dataset catalogue: https://open.canada.ca/data/api/3/action/package_show?id=6abd20d4-7a1c-4b38-baa2-9525d0bb2fd2
+
+  NOTE: The old CanadaBuys REST API at
   https://canadabuys.canada.ca/en/tender-opportunities/api/v1/notices
+  was retired when buyandsell.gc.ca migrated to CanadaBuys (Drupal 10).
+  It now returns HTTP 403.
 
 Usage:
     source = ProcurementSource()
@@ -41,17 +48,33 @@ log = structlog.get_logger(__name__)
 Dataset = Literal["contracts", "tenders"]
 
 # CKAN dataset ID for proactive disclosure of contracts
-_CKAN_DATASET_ID = "d8f85d91-7dec-4fd1-8f59-35571b88e4d1"
+_CKAN_DATASET_ID = "d8f85d91-7dec-4fd1-8055-483b77225d8b"
 _CKAN_API_URL = "https://open.canada.ca/data/api/3/action/package_show"
 
 # Fallback direct download URL if CKAN API fails
+# (The old datastore/dump endpoint was retired; this is the current
+#  direct-download link for "Contracts over $10,000".)
 _PROACTIVE_CSV_URL = (
-    "https://open.canada.ca/data/en/datastore/dump/d8f85d91-7dec-4fd1-8055-483b77225d8b"
-    "?bom=True&format=csv"
+    "https://open.canada.ca/data/dataset/d8f85d91-7dec-4fd1-8055-483b77225d8b"
+    "/resource/fac950c0-00d5-4ec1-a4d3-9cbebf98a305/download/contracts.csv"
 )
 
-_CANADABUYS_TENDERS_URL = (
-    "https://canadabuys.canada.ca/en/tender-opportunities/api/v1/notices"
+# CanadaBuys tender CSV feeds (replaced the retired REST API)
+_CANADABUYS_OPEN_TENDERS_URL = (
+    "https://canadabuys.canada.ca/opendata/pub/"
+    "openTenderNotice-ouvertAvisAppelOffres.csv"
+)
+_CANADABUYS_COMPLETE_TENDERS_URL = (
+    "https://canadabuys.canada.ca/opendata/pub/"
+    "tenderNoticeComplete-avisAppelOffresComplet.csv"
+)
+# CKAN dataset ID for the CanadaBuys tender notices catalogue
+_TENDERS_CKAN_DATASET_ID = "6abd20d4-7a1c-4b38-baa2-9525d0bb2fd2"
+
+# The CanadaBuys domain blocks requests without a browser-like User-Agent.
+_BROWSER_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 )
 
 # Department name normalization for common misspellings / abbreviations
@@ -167,12 +190,20 @@ class ProcurementSource(BaseSource):
             return payload["result"]
 
     def _extract_csv_urls(self, ckan_result: dict[str, Any]) -> list[str]:
-        """Extract CSV resource URLs from CKAN package metadata."""
+        """Extract *contract* CSV resource URLs from CKAN package metadata.
+
+        Filters to CSVs whose name matches the expected contract
+        datasets ("Contracts over $10,000" and the legacy equivalent).
+        Excludes unrelated CSVs like "Nothing to Report" or
+        "Aggregated Total" that have different schemas.
+        """
+        _WANT = {"contracts over $10,000", "contracts over $10,000 – legacy data"}
         urls: list[str] = []
         for resource in ckan_result.get("resources", []):
             fmt = (resource.get("format") or "").upper()
+            name = (resource.get("name") or "").strip().lower()
             url = resource.get("url", "")
-            if fmt == "CSV" and url:
+            if fmt == "CSV" and url and name in _WANT:
                 urls.append(url)
         return urls
 
@@ -188,32 +219,26 @@ class ProcurementSource(BaseSource):
             return r.content
 
     @with_retry(max_attempts=3, base_delay=1.0, retry_on=(httpx.HTTPError,))
-    async def _fetch_tenders_page(
-        self, page: int = 1, per_page: int = 100
-    ) -> dict[str, Any]:
-        """Fetch a page of active tenders from the CanadaBuys API."""
-        params = {
-            "status": "active",
-            "page": page,
-            "per_page": per_page,
-            "format": "json",
-        }
-        self._log.debug("tenders_fetch", page=page)
+    async def _download_tenders_csv(self, url: str) -> bytes:
+        """Download a CanadaBuys tender-notice CSV.
+
+        The canadabuys.canada.ca domain blocks requests without a
+        browser-like User-Agent header, so we override it here.
+        """
+        self._log.info("tenders_csv_download", url=url[:120])
         async with httpx.AsyncClient(
-            timeout=self._timeout, follow_redirects=True
+            timeout=self._timeout,
+            follow_redirects=True,
+            headers={"User-Agent": _BROWSER_UA},
         ) as client:
-            r = await client.get(_CANADABUYS_TENDERS_URL, params=params)
-            # Fail fast on 4xx — these are permanent client errors
-            # (e.g. 403 from the retired CanadaBuys API) and not
-            # worth retrying.  Wrap in RuntimeError so it bypasses
-            # the retry_on=(httpx.HTTPError,) filter.
+            r = await client.get(url)
             if r.is_client_error:
                 raise RuntimeError(
                     f"Client error '{r.status_code} {r.reason_phrase}' "
                     f"for url '{r.url}'"
                 )
             r.raise_for_status()
-            return r.json()
+            return r.content
 
     # ------------------------------------------------------------------
     # BaseSource interface
@@ -232,7 +257,7 @@ class ProcurementSource(BaseSource):
         For contracts: queries CKAN API for CSV resource URLs, downloads and
         concatenates all CSVs. Falls back to direct URL if CKAN fails.
 
-        For tenders: paginates the CanadaBuys API.
+        For tenders: downloads CanadaBuys open-data CSV feed.
         """
         if dataset == "contracts":
             return await self._extract_contracts()
@@ -278,40 +303,54 @@ class ProcurementSource(BaseSource):
         return pl.concat(dfs, how="diagonal_relaxed")
 
     async def _extract_tenders(self, max_tenders: int) -> pl.DataFrame:
-        """Paginate the CanadaBuys tender API.
+        """Download tender notices from CanadaBuys open-data CSV feeds.
 
-        NOTE: The CanadaBuys REST API was retired when buyandsell.gc.ca
-        migrated to a Drupal 10 site at canadabuys.canada.ca.  The endpoint
-        now returns 403/404. This method is kept for forward-compatibility in
-        case a replacement API is published.  Until then it will log a
-        warning and return an empty DataFrame.
+        Tries the "open tenders" CSV first (smaller, currently-open only).
+        Falls back to the complete archive if the open-tenders endpoint
+        fails.  If all downloads fail, logs a warning and returns an
+        empty DataFrame — the pipeline continues without crashing.
         """
-        all_notices: list[dict[str, Any]] = []
-        page = 1
-        while len(all_notices) < max_tenders:
+        urls = [
+            ("open_tenders", _CANADABUYS_OPEN_TENDERS_URL),
+            ("complete_tenders", _CANADABUYS_COMPLETE_TENDERS_URL),
+        ]
+
+        for label, url in urls:
             try:
-                payload = await self._fetch_tenders_page(page)
+                raw_bytes = await self._download_tenders_csv(url)
+                # Handle UTF-8 BOM
+                if raw_bytes.startswith(b"\xef\xbb\xbf"):
+                    raw_bytes = raw_bytes[3:]
+                df = pl.read_csv(
+                    io.BytesIO(raw_bytes),
+                    infer_schema_length=0,
+                    truncate_ragged_lines=True,
+                    encoding="utf8-lossy",
+                )
+                if not df.is_empty():
+                    if max_tenders and len(df) > max_tenders:
+                        df = df.head(max_tenders)
+                    self._log.info(
+                        "tenders_csv_loaded",
+                        feed=label,
+                        url=url[:80],
+                        rows=len(df),
+                    )
+                    return df
             except Exception as exc:
                 self._log.warning(
-                    "tenders_api_unavailable",
-                    page=page,
+                    "tenders_csv_failed",
+                    feed=label,
+                    url=url[:80],
                     error=str(exc),
-                    hint="The CanadaBuys REST API has been retired. "
-                    "Tenders extraction is skipped until a replacement "
-                    "API is available.",
                 )
-                break
-            notices = payload.get("data", payload.get("notices", []))
-            if not notices:
-                break
-            all_notices.extend(notices)
-            if len(notices) < 100:
-                break
-            page += 1
 
-        if not all_notices:
-            return pl.DataFrame()
-        return pl.from_dicts(all_notices)
+        self._log.warning(
+            "tenders_all_sources_failed",
+            hint="All CanadaBuys CSV feeds failed. "
+            "Tenders extraction is skipped.",
+        )
+        return pl.DataFrame()
 
     def transform(
         self, raw: pl.DataFrame, *, dataset: Dataset = "contracts"
@@ -331,11 +370,13 @@ class ProcurementSource(BaseSource):
         if raw.is_empty():
             return raw
 
-        df = self._normalize_columns(raw)
-
         if dataset == "contracts":
+            df = self._normalize_columns(raw)
             return self._transform_contracts(df)
-        return self._transform_tenders(df)
+        # Tenders: skip _normalize_columns — the CanadaBuys CSV uses
+        # bilingual column names that are mapped directly in
+        # _transform_tenders().
+        return self._transform_tenders(raw)
 
     def _transform_contracts(self, df: pl.DataFrame) -> pl.DataFrame:
         """Map proactive disclosure CSV columns to contracts table schema."""
@@ -456,21 +497,74 @@ class ProcurementSource(BaseSource):
         return result
 
     def _transform_tenders(self, df: pl.DataFrame) -> pl.DataFrame:
-        """Map CanadaBuys API fields to tenders table schema."""
+        """Map CanadaBuys CSV fields to tenders table schema.
+
+        The CSV uses bilingual column names like
+        ``referenceNumber-numeroReference``.  We match either the new
+        CanadaBuys CSV names or the legacy API field names so the
+        transform stays backwards-compatible.
+
+        Column normalization is intentionally *not* applied here
+        (unlike contracts) because the bilingual column names would
+        produce unreadable snake_case identifiers.
+        """
+        # Strip stray quotes from column names (polars CSV reader
+        # usually handles this, but belt-and-suspenders).
+        rename = {c: c.strip('"') for c in df.columns if c.startswith('"') or c.endswith('"')}
+        if rename:
+            df = df.rename(rename)
         col_map = {
-            "tender_number": ["reference_number", "tender_number", "notice_id"],
-            "title": ["title", "title_en", "subject"],
-            "department": ["department", "buyer_name", "organization"],
-            "closing_date": ["closing_date", "close_date", "closing"],
-            "status": ["status", "notice_status"],
+            "tender_number": [
+                "referenceNumber-numeroReference",
+                "reference_number",
+                "tender_number",
+                "notice_id",
+            ],
+            "title": [
+                "title-titre-eng",
+                "title",
+                "title_en",
+                "subject",
+            ],
+            "department": [
+                "contractingEntityName-nomEntitContractante-eng",
+                "department",
+                "buyer_name",
+                "organization",
+            ],
+            "closing_date": [
+                "tenderClosingDate-appelOffresDateCloture",
+                "closing_date",
+                "close_date",
+                "closing",
+            ],
+            "status": [
+                "tenderStatus-appelOffresStatut-eng",
+                "status",
+                "notice_status",
+            ],
             "estimated_value": [
                 "estimated_value",
                 "budget",
                 "contract_value",
             ],
-            "category": ["category", "commodity", "gsin"],
-            "region": ["region", "delivery_region"],
-            "source_url": ["url", "source_url", "link"],
+            "category": [
+                "procurementCategory-categorieApprovisionnement",
+                "category",
+                "commodity",
+                "gsin",
+            ],
+            "region": [
+                "regionsOfDelivery-regionsLivraison-eng",
+                "region",
+                "delivery_region",
+            ],
+            "source_url": [
+                "noticeURL-URLavis-eng",
+                "url",
+                "source_url",
+                "link",
+            ],
         }
 
         def pick(candidates: list[str]) -> str | None:
@@ -485,8 +579,13 @@ class ProcurementSource(BaseSource):
             src = pick(candidates)
             if src:
                 if out_col == "closing_date":
+                    # CSV values may be ISO datetime (2026-03-24T14:00:00)
+                    # or plain date; extract the date portion.
                     exprs.append(
-                        pl.col(src).str.to_date(strict=False).alias(out_col)
+                        pl.col(src)
+                        .str.slice(0, 10)
+                        .str.to_date(strict=False)
+                        .alias(out_col)
                     )
                 elif out_col == "estimated_value":
                     exprs.append(
@@ -495,6 +594,23 @@ class ProcurementSource(BaseSource):
                 elif out_col == "department":
                     # Batch lookup instead of map_elements
                     dept_src = src
+                elif out_col == "category":
+                    # CanadaBuys CSV uses prefixed values like "*SRV";
+                    # strip leading '*' and whitespace.
+                    exprs.append(
+                        pl.col(src)
+                        .str.strip_chars()
+                        .str.replace(r"^\*", "")
+                        .alias(out_col)
+                    )
+                elif out_col == "region":
+                    # Same star-prefix pattern for regions.
+                    exprs.append(
+                        pl.col(src)
+                        .str.strip_chars()
+                        .str.replace(r"^\*", "")
+                        .alias(out_col)
+                    )
                 else:
                     exprs.append(pl.col(src).alias(out_col))
 
@@ -522,6 +638,11 @@ class ProcurementSource(BaseSource):
         return {
             "source_name": self.name,
             "ckan_dataset_id": _CKAN_DATASET_ID,
-            "tenders_url": _CANADABUYS_TENDERS_URL,
-            "description": "Federal proactive disclosure contracts and CanadaBuys tenders",
+            "tenders_ckan_dataset_id": _TENDERS_CKAN_DATASET_ID,
+            "tenders_open_url": _CANADABUYS_OPEN_TENDERS_URL,
+            "tenders_complete_url": _CANADABUYS_COMPLETE_TENDERS_URL,
+            "description": (
+                "Federal proactive disclosure contracts and "
+                "CanadaBuys tender notices (CSV feeds)"
+            ),
         }

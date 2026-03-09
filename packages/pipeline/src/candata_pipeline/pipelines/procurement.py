@@ -3,7 +3,14 @@ pipelines/procurement.py — Federal contracts and tenders pipeline.
 
 Ingests:
   - Proactive disclosure contracts CSV → contracts table
-  - CanadaBuys active tenders → tenders table
+    Source: CKAN API on open.canada.ca (dataset d8f85d91-…)
+  - CanadaBuys tender notice CSV feeds → tenders table
+    Source: canadabuys.canada.ca/opendata/pub/ (open + complete archives)
+
+NOTE: The old CanadaBuys REST API at
+    https://canadabuys.canada.ca/en/tender-opportunities/api/v1/notices
+was retired when buyandsell.gc.ca migrated to CanadaBuys (Drupal 10).
+Tender data is now sourced from published CSV feeds instead.
 
 Entity resolution: vendor names are normalized and optionally linked to
 entities table entries (requires entity cache loaded separately).

@@ -90,6 +90,8 @@ data/
 .supabase/
 supabase/.branches/
 supabase/.temp/
+supabase/snippits
+
 
 # Logs
 logs/
@@ -114,4 +116,4 @@ Thumbs.db
 # Stripe CLI
 .stripe/
 
-supabase/snippits
+
