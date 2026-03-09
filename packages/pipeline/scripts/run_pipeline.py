@@ -147,6 +147,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Extract and transform but do not write to Supabase",
     )
     parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print row counts and sample data at each transform stage",
+    )
+    parser.add_argument(
         "--log-level",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         default="INFO",
@@ -213,6 +218,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
                 start_date=args.start_date,
                 end_date=args.end_date,
                 dry_run=args.dry_run,
+                debug=getattr(args, 'debug', False),
             )
             log.info("done", records_loaded=result.records_loaded, status=result.status)
 

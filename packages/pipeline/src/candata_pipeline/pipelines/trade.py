@@ -2,11 +2,14 @@
 pipelines/trade.py — Canadian international merchandise trade pipeline.
 
 Ingests two StatCan CIMT tables:
-  - Table 12-10-0011-01: commodity trade by HS code (imports/exports)
-  - Table 12-10-0126-01: bilateral trade by partner country
+  - Table 12-10-0121-01: commodity trade by NAPCS code (dollar values)
+  - Table 12-10-0011-01: aggregate trade by principal trading partner
 
 Upserts to trade_flows with composite unique key:
   (direction, hs_code, partner_country, province, ref_date)
+
+Note: Table 12-10-0126-01 (price indexes) is intentionally NOT used —
+its VALUE column contains index values, not dollar amounts.
 
 Usage:
     from candata_pipeline.pipelines.trade import run
@@ -16,6 +19,7 @@ CLI:
     python scripts/run_pipeline.py trade
     python scripts/run_pipeline.py trade --start-date 2020-01-01
     python scripts/run_pipeline.py trade --dry-run
+    python scripts/run_pipeline.py trade --debug
 """
 
 from __future__ import annotations
@@ -38,17 +42,26 @@ async def _load_commodity_trade(
     start_date: date | None,
     end_date: date | None,
     dry_run: bool,
+    debug: bool = False,
 ) -> LoadResult:
-    """Fetch, transform, and upsert commodity trade data (table 12-10-0011)."""
-    raw = await source.extract(table_pid="12100011")
-    df = source.transform(raw, start_date=start_date, end_date=end_date)
+    """Fetch, transform, and upsert commodity trade data (table 12-10-0121)."""
+    raw = await source.extract(table_pid="12100121")
+    if debug:
+        print(f"\n--- Commodity trade (12-10-0121) ---")
+        print(f"  Downloaded: {len(raw):,} raw rows")
+
+    df = source.transform(raw, start_date=start_date, end_date=end_date, debug=debug)
 
     if df.is_empty():
         log.warning("commodity_trade_empty")
+        if debug:
+            print("  RESULT: 0 rows after transform (empty)")
         return LoadResult(table="trade_flows")
 
     df = deduplicate_series(df, CONFLICT_COLUMNS, keep="last")
     log.info("commodity_trade_ready", rows=len(df))
+    if debug:
+        print(f"  After dedup: {len(df):,} rows")
 
     if dry_run:
         return LoadResult(table="trade_flows", records_loaded=len(df))
@@ -56,23 +69,32 @@ async def _load_commodity_trade(
     return await loader.upsert("trade_flows", df, conflict_columns=CONFLICT_COLUMNS)
 
 
-async def _load_bilateral_trade(
+async def _load_partner_trade(
     source: TradeSource,
     loader: SupabaseLoader,
     start_date: date | None,
     end_date: date | None,
     dry_run: bool,
+    debug: bool = False,
 ) -> LoadResult:
-    """Fetch, transform, and upsert bilateral trade data (table 12-10-0126)."""
-    raw = await source.extract(table_pid="12100126")
-    df = source.transform_bilateral(raw, start_date=start_date, end_date=end_date)
+    """Fetch, transform, and upsert partner-level trade data (table 12-10-0011)."""
+    raw = await source.extract(table_pid="12100011")
+    if debug:
+        print(f"\n--- Partner trade (12-10-0011) ---")
+        print(f"  Downloaded: {len(raw):,} raw rows")
+
+    df = source.transform_partner(raw, start_date=start_date, end_date=end_date, debug=debug)
 
     if df.is_empty():
-        log.warning("bilateral_trade_empty")
+        log.warning("partner_trade_empty")
+        if debug:
+            print("  RESULT: 0 rows after transform (empty)")
         return LoadResult(table="trade_flows")
 
     df = deduplicate_series(df, CONFLICT_COLUMNS, keep="last")
-    log.info("bilateral_trade_ready", rows=len(df))
+    log.info("partner_trade_ready", rows=len(df))
+    if debug:
+        print(f"  After dedup: {len(df):,} rows")
 
     if dry_run:
         return LoadResult(table="trade_flows", records_loaded=len(df))
@@ -85,17 +107,19 @@ async def run(
     start_date: date | None = None,
     end_date: date | None = None,
     dry_run: bool = False,
+    debug: bool = False,
 ) -> LoadResult:
     """
     Run the trade pipeline.
 
-    Downloads commodity and bilateral trade tables from StatCan, transforms
+    Downloads commodity and partner trade tables from StatCan, transforms
     to the trade_flows schema, and upserts to Supabase.
 
     Args:
         start_date: Earliest reference date to include (optional).
         end_date:   Latest reference date to include (optional).
         dry_run:    Transform but do not write to Supabase.
+        debug:      Print row counts at each transform stage.
 
     Returns:
         Combined LoadResult across both tables.
@@ -126,16 +150,16 @@ async def run(
 
     try:
         commodity_result = await _load_commodity_trade(
-            source, loader, start_date, end_date, dry_run
+            source, loader, start_date, end_date, dry_run, debug
         )
-        bilateral_result = await _load_bilateral_trade(
-            source, loader, start_date, end_date, dry_run
+        partner_result = await _load_partner_trade(
+            source, loader, start_date, end_date, dry_run, debug
         )
 
         combined = LoadResult(
             table="trade_flows",
-            records_loaded=commodity_result.records_loaded + bilateral_result.records_loaded,
-            records_failed=commodity_result.records_failed + bilateral_result.records_failed,
+            records_loaded=commodity_result.records_loaded + partner_result.records_loaded,
+            records_failed=commodity_result.records_failed + partner_result.records_failed,
         )
         if loader and run_id:
             await loader.finish_pipeline_run(
@@ -143,7 +167,7 @@ async def run(
                 combined,
                 metadata={
                     "commodity_rows": commodity_result.records_loaded,
-                    "bilateral_rows": bilateral_result.records_loaded,
+                    "partner_rows": partner_result.records_loaded,
                 },
             )
 
@@ -151,6 +175,13 @@ async def run(
         if loader and run_id:
             await loader.fail_pipeline_run(run_id, str(exc))
         raise
+
+    if debug:
+        print(f"\n{'='*50}")
+        print(f"  TOTAL: {combined.records_loaded:,} loaded, {combined.records_failed:,} failed")
+        print(f"    commodity: {commodity_result.records_loaded:,}")
+        print(f"    partner:   {partner_result.records_loaded:,}")
+        print(f"{'='*50}")
 
     log.info(
         "trade_pipeline_complete",
